@@ -74,7 +74,7 @@ function fullSync() {
 
 /**
  * Dry run over a short window: lists what would be imported without writing
- * anything to the team calendar, and without touching the 'lastRun' property.
+ * anything to the team calendar, and without updating any calendar checkpoints.
  * Run this manually from the editor to test the configuration.
  */
 function testSync() {
@@ -87,7 +87,7 @@ function testSync() {
  * @param {number} options.daysAhead Look this many days ahead instead of
  *     MONTHS_IN_ADVANCE months.
  * @param {boolean} options.dryRun Log events instead of importing them, and
- *     leave 'lastRun' untouched.
+ *     leave calendar checkpoints untouched.
  * @param {boolean} options.ignoreLastRun Scan the whole window rather than only
  *     events modified since the last run.
  * @param {boolean} options.strictMatch Overrides the STRICT_MATCH constant.
@@ -118,11 +118,9 @@ function performSync(options) {
     options.dryRun ? " (dry run)" : "",
   );
 
-  // Determines the time the the script was last run.
-  let lastRun = options.ignoreLastRun
-    ? null
-    : PropertiesService.getScriptProperties().getProperty("lastRun");
-  lastRun = lastRun ? new Date(lastRun) : null;
+  // Each calendar advances independently. Missing checkpoints trigger a full
+  // scan, including the first run after upgrading from the global lastRun.
+  const properties = PropertiesService.getScriptProperties();
 
   // Gets the list of people with write access to the team calendar.
   const users = getCalendarEditors(TEAM_CALENDAR_ID);
@@ -136,51 +134,61 @@ function performSync(options) {
 
   let count = 0;
   let skipped = 0;
+  let failed = 0;
   for (const email of users) {
-    const username = email.split("@")[0];
-    const events = findEvents(email, today, maxDate, lastRun);
-    for (const event of events) {
-      if (event.status === "cancelled" || (strict && !isStrictMatch(event))) {
-        removeImportedEvent(email, username, event, options.dryRun);
-        console.log(
-          "Excluded or cancelled: [%s] %s",
-          username,
-          event.summary,
-        );
-        skipped++;
-        continue;
+    const checkpoint = `lastRun:${TEAM_CALENDAR_ID}:${email}`;
+    try {
+      const lastRun = options.ignoreLastRun
+        ? null
+        : properties.getProperty(checkpoint);
+      const events = findEvents(
+        email, today, maxDate, lastRun ? new Date(lastRun) : null,
+      );
+      const result = syncUserEvents(email, events, strict, options.dryRun);
+      count += result.count;
+      skipped += result.skipped;
+      if (!options.dryRun) {
+        properties.setProperty(checkpoint, today.toISOString());
       }
-      if (options.dryRun) {
-        const summary = buildSummary(username, event);
-        if (isAllDayEvent(event)) {
-          convertToAllDay(event);
-          console.log(
-            "Would import: %s (all day, %s to %s exclusive)",
-            summary,
-            event.start.date,
-            event.end.date,
-          );
-        } else {
-          console.log(
-            "Would import: %s (%s)",
-            summary,
-            event.start.dateTime,
-          );
-        }
-      } else {
-        importEvent(username, event, email);
-      }
-      count++;
+    } catch (error) {
+      failed++;
+      console.error("Sync failed for %s: %s; will retry next run", email, String(error));
     }
   }
 
-  if (!options.dryRun) {
-    PropertiesService.getScriptProperties().setProperty("lastRun", today.toISOString());
-  }
   console.log(
-    `${options.dryRun ? "Would import" : "Imported"} ${count} events` +
-      (strict ? `, skipped ${skipped} non-matching` : ""),
+    `${options.dryRun ? "Would import" : "Imported"} ${count} events from completed calendars` +
+      `, excluded or cancelled ${skipped}, failed calendars ${failed}`,
   );
+}
+
+/** Sync one calendar; any failure leaves its checkpoint unchanged. */
+function syncUserEvents(email, events, strict, dryRun) {
+  const username = email.split("@")[0];
+  let count = 0;
+  let skipped = 0;
+  for (const event of events) {
+    if (event.status === "cancelled" || (strict && !isStrictMatch(event))) {
+      removeImportedEvent(email, username, event, dryRun);
+      skipped++;
+      continue;
+    }
+    if (dryRun) {
+      const copy = JSON.parse(JSON.stringify(event));
+      if (isAllDayEvent(copy)) convertToAllDay(copy);
+      console.log(
+        "Would import as Free: %s (%s to %s%s)",
+        buildSummary(username, copy),
+        copy.start.date || copy.start.dateTime,
+        copy.end.date || copy.end.dateTime,
+        copy.start.date ? ", all day; end exclusive" : "",
+      );
+    } else {
+      importEvent(username, event, email);
+    }
+    count++;
+  }
+  return { count, skipped };
 }
 
 /**
@@ -355,6 +363,7 @@ function importEvent(username, event, email) {
     id: TEAM_CALENDAR_ID,
   };
   event.attendees = [];
+  event.transparency = "transparent"; // Show as Free on the team calendar.
 
   // If the event is not of type 'default', it can't be imported, so it needs
   // to be changed.
@@ -365,7 +374,7 @@ function importEvent(username, event, email) {
   }
 
   console.log("Importing: %s", event.summary);
-  // Let failures abort the run so lastRun is preserved for the next retry.
+  // Let failures reach the per-user handler so this calendar is retried.
   Calendar.Events.import(event, TEAM_CALENDAR_ID);
 }
 
@@ -410,7 +419,7 @@ function findEvents(email, start, end, optSince) {
  * @return {string} a formatted date string.
  */
 function formatDateAsRFC3339(date) {
-  return Utilities.formatDate(date, "UTC", "yyyy-MM-dd'T'HH:mm:ssZ");
+  return date.toISOString();
 }
 
 /**
