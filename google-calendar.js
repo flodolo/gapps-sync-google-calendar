@@ -92,7 +92,17 @@ function testSync() {
  *     events modified since the last run.
  * @param {boolean} options.strictMatch Overrides the STRICT_MATCH constant.
  */
-function runSync(options) {
+function runSync(options = {}) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    performSync(options);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function performSync(options) {
   // Defines the calendar event date range to search.
   const today = new Date();
   const maxDate = new Date();
@@ -130,9 +140,10 @@ function runSync(options) {
     const username = email.split("@")[0];
     const events = findEvents(email, today, maxDate, lastRun);
     for (const event of events) {
-      if (strict && !isStrictMatch(event)) {
+      if (event.status === "cancelled" || (strict && !isStrictMatch(event))) {
+        removeImportedEvent(email, username, event, options.dryRun);
         console.log(
-          "Skipping (not a strict match): [%s] %s",
+          "Excluded or cancelled: [%s] %s",
           username,
           event.summary,
         );
@@ -157,18 +168,18 @@ function runSync(options) {
           );
         }
       } else {
-        importEvent(username, event);
+        importEvent(username, event, email);
       }
       count++;
     }
   }
 
   if (!options.dryRun) {
-    PropertiesService.getScriptProperties().setProperty("lastRun", today);
+    PropertiesService.getScriptProperties().setProperty("lastRun", today.toISOString());
   }
   console.log(
     `${options.dryRun ? "Would import" : "Imported"} ${count} events` +
-    (strict ? `, skipped ${skipped} non-matching` : ""),
+      (strict ? `, skipped ${skipped} non-matching` : ""),
   );
 }
 
@@ -211,35 +222,23 @@ function convertToAllDay(event) {
     // Already a date-only event.
     return;
   }
-  const timeZone = event.start.timeZone || Session.getScriptTimeZone();
-  const start = new Date(event.start.dateTime);
-  const end = new Date(event.end.dateTime);
-
-  const startDate = Utilities.formatDate(start, timeZone, "yyyy-MM-dd");
-  // Step back a second so an end of midnight counts as the previous day, then
-  // add one day to get the exclusive end date.
-  const lastDay = Utilities.formatDate(
-    new Date(end.getTime() - 1000),
-    timeZone,
-    "yyyy-MM-dd",
-  );
-  const parts = lastDay.split("-");
-  const exclusiveEnd = new Date(
-    Date.UTC(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])),
-  );
-  exclusiveEnd.setUTCDate(exclusiveEnd.getUTCDate() + 1);
-
-  event.start = { date: startDate };
-  event.end = {
-    date: Utilities.formatDate(exclusiveEnd, "UTC", "yyyy-MM-dd"),
-  };
+  const start = eventLocalParts(event.start, event.start.timeZone);
+  const end = eventLocalParts(event.end, event.start.timeZone);
+  let endDate = end.date;
+  if (end.time.startsWith("23:59:")) {
+    const next = new Date(`${end.date}T00:00:00Z`);
+    next.setUTCDate(next.getUTCDate() + 1);
+    endDate = next.toISOString().slice(0, 10);
+  }
+  event.start = { date: start.date };
+  event.end = { date: endDate };
 }
 
 /**
  * Decides whether an event covers whole days. Ordinary all-day events use a
  * date-only 'date' field, but out-of-office events always carry a 'dateTime'
  * even when created as full-day, so those are detected by checking that they
- * start at midnight and run for at least a full day.
+ * start at midnight and end at midnight (or 23:59).
  * @param {Calendar.Event} event The event to test.
  * @return {boolean} True if the event covers one or more whole days.
  */
@@ -253,14 +252,82 @@ function isAllDayEvent(event) {
   if (!event.start.dateTime || !event.end.dateTime) {
     return false;
   }
-  const start = new Date(event.start.dateTime);
-  const end = new Date(event.end.dateTime);
-  const timeZone = event.start.timeZone || Session.getScriptTimeZone();
-  const startsAtMidnight =
-    Utilities.formatDate(start, timeZone, "HH:mm") === "00:00";
-  // Allow a little slack: some clients end the day at 23:59 instead of 00:00.
-  const durationHours = (end.getTime() - start.getTime()) / (1000 * 60 * 60);
-  return startsAtMidnight && durationHours >= 23;
+  const start = eventLocalParts(event.start, event.start.timeZone);
+  const end = eventLocalParts(event.end, event.start.timeZone);
+  return start.time === "00:00:00" &&
+    ((end.time === "00:00:00" && end.date > start.date) ||
+      (end.time.startsWith("23:59:") && end.date >= start.date));
+}
+
+/** Returns local date/time using the event zone or its explicit UTC offset. */
+function eventLocalParts(boundary, timeZone) {
+  if (timeZone || boundary.timeZone) {
+    const date = new Date(boundary.dateTime);
+    const zone = timeZone || boundary.timeZone;
+    return {
+      date: Utilities.formatDate(date, zone, "yyyy-MM-dd"),
+      time: Utilities.formatDate(date, zone, "HH:mm:ss"),
+    };
+  }
+  const match = boundary.dateTime.match(
+    /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.0+)?(?:Z|[+-]\d{2}:\d{2})$/,
+  );
+  if (!match) {
+    return { date: "", time: "" };
+  }
+  return { date: match[1], time: match[2] };
+}
+
+/** Remove only copies identifiable as this script's imports. */
+function removeImportedEvent(email, username, event, dryRun) {
+  const sourceKey = `${email}/${event.id}`;
+  const candidates = new Map();
+  let pageToken;
+  do {
+    const response = Calendar.Events.list(TEAM_CALENDAR_ID, {
+      privateExtendedProperty: `awaySource=${sourceKey}`,
+      pageToken,
+    });
+    for (const copy of response.items || []) candidates.set(copy.id, copy);
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+
+  // Earlier versions sent the source ID but did not tag their imports.
+  // Try that ID first; imports may instead have a generated destination ID.
+  if (!candidates.size) {
+    let copy;
+    try {
+      copy = Calendar.Events.get(TEAM_CALENDAR_ID, event.id);
+    } catch (error) {
+      if (!/not found|gone|404|410/i.test(String(error))) throw error;
+    }
+    if (copy && (copy.summary || "").startsWith(`[${username}] `)) {
+      candidates.set(copy.id, copy);
+    }
+  }
+  if (!candidates.size && event.iCalUID && !event.recurringEventId) {
+    do {
+      const response = Calendar.Events.list(TEAM_CALENDAR_ID, {
+        iCalUID: event.iCalUID,
+        pageToken,
+      });
+      for (const copy of response.items || []) {
+        if (!copy.recurringEventId &&
+            (copy.summary || "").startsWith(`[${username}] `)) {
+          candidates.set(copy.id, copy);
+        }
+      }
+      pageToken = response.nextPageToken;
+    } while (pageToken);
+  }
+  for (const copy of candidates.values()) {
+    if (copy.status === "cancelled") continue;
+    if (dryRun) {
+      console.log("Would remove: %s", copy.summary);
+    } else {
+      Calendar.Events.remove(TEAM_CALENDAR_ID, copy.id);
+    }
+  }
 }
 
 /**
@@ -269,7 +336,9 @@ function isAllDayEvent(event) {
  * @param {string} username The team member that is attending the event.
  * @param {Calendar.Event} event The event to import.
  */
-function importEvent(username, event) {
+function importEvent(username, event, email) {
+  event = JSON.parse(JSON.stringify(event));
+  event.extendedProperties = { private: { awaySource: `${email}/${event.id}` } };
   event.summary = buildSummary(username, event);
   if (SANITIZE_EVENTS) {
     // Personal calendars can hold details the team calendar should not expose.
@@ -296,14 +365,8 @@ function importEvent(username, event) {
   }
 
   console.log("Importing: %s", event.summary);
-  try {
-    Calendar.Events.import(event, TEAM_CALENDAR_ID);
-  } catch (e) {
-    console.error(
-      "Error attempting to import event: %s. Skipping.",
-      e.toString(),
-    );
-  }
+  // Let failures abort the run so lastRun is preserved for the next retry.
+  Calendar.Events.import(event, TEAM_CALENDAR_ID);
 }
 
 /**
@@ -333,18 +396,8 @@ function findEvents(email, start, end, optSince) {
   let events = [];
   do {
     params.pageToken = pageToken;
-    let response;
-    try {
-      response = Calendar.Events.list(email, params);
-    } catch (e) {
-      console.error(
-        "Error retrieving events for %s: %s; skipping",
-        email,
-        e.toString(),
-      );
-      break;
-    }
-    events = events.concat(response.items);
+    const response = Calendar.Events.list(email, params);
+    events = events.concat(response.items || []);
     pageToken = response.nextPageToken;
   } while (pageToken);
   return events;
@@ -379,7 +432,7 @@ function inspectEvents() {
         event.summary,
         JSON.stringify(event.start),
         JSON.stringify(event.end),
-        event.start.timeZone || "(none)",
+        (event.start && event.start.timeZone) || "(none)",
         isAllDayEvent(event),
         isStrictMatch(event),
       );
