@@ -5,11 +5,11 @@ const source = fs.readFileSync(require('node:path').join(__dirname, 'google-cale
 let passed = 0;
 function test(name, fn) { fn(); passed++; console.log('PASS', name); }
 function context() {
-  const state = {writes:0, removed:[], imports:[], released:0, properties:{}};
+  const state = {writes:0, removed:[], imports:[], released:0, properties:{}, logs:[]};
   const c = {
-    console:{log(){}, error(){}},
+    console:{log(...args){state.logs.push(require('node:util').format(...args));}, error(){}},
     LockService:{getScriptLock:()=>({waitLock(){}, releaseLock(){state.released++;}})},
-    PropertiesService:{getScriptProperties:()=>({getProperty:(key)=>state.properties[key] || null,setProperty(key,value){state.writes++;state.properties[key]=value;}})},
+    PropertiesService:{getScriptProperties:()=>({getProperties:()=>({...state.properties}),deleteProperty(key){delete state.properties[key];},getProperty:(key)=>state.properties[key] || null,setProperty(key,value){state.writes++;state.properties[key]=value;}})},
     Utilities:{formatDate(date, timeZone, pattern) {
       if (pattern.includes("yyyy-MM-dd'T'")) return date.toISOString();
       const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(date).map(p=>[p.type,p.value]));
@@ -41,16 +41,16 @@ test('DST short and long days and 23:59 ending',()=>{
 });
 test('ID-only cancellation removes tagged copy before filtering',()=>{
  const {c,state}=context();c.findEvents=()=>[{id:'source',status:'cancelled'}];
- c.Calendar.Events.list=()=>({items:[{id:'copy',summary:'[alice] Away'}]});
+ c.Calendar.Events.list=()=>({items:[{id:'copy',summary:'[alice] Away',extendedProperties:{private:{awaySource:'alice@example.com/source'}}}]});
  c.runSync();assert.deepEqual(state.removed,['copy']);assert.equal(state.writes,1);
 });
 test('renamed event removes legacy copy by UID',()=>{
  const {c,state}=context();const e=timed('2026-09-12T09:00:00Z','2026-09-12T12:00:00Z');e.iCalUID='uid';c.findEvents=()=>[e];
- c.Calendar.Events.list=(cal,params)=>({items:params.iCalUID?[{id:'legacy',summary:'[alice] PTO'}]:[]});
+ c.Calendar.Events.list=(cal,params)=>({items:[{id:'legacy',iCalUID:'uid',summary:'[alice] PTO'}]});
  c.runSync();assert.deepEqual(state.removed,['legacy']);
 });
 test('dry run does not delete, import, or advance timestamp',()=>{
- const {c,state}=context();c.findEvents=()=>[{id:'source',status:'cancelled'}];c.Calendar.Events.list=()=>({items:[{id:'copy'}]});
+ const {c,state}=context();c.findEvents=()=>[{id:'source',status:'cancelled'}];c.Calendar.Events.list=()=>({items:[{id:'copy',extendedProperties:{private:{awaySource:'alice@example.com/source'}}}]});
  c.runSync({dryRun:true});assert.equal(state.writes,0);assert.equal(state.removed.length,0);assert.equal(state.imports.length,0);
 });
 test('fetch, import, and delete failures preserve timestamp and release lock',()=>{
@@ -58,8 +58,8 @@ test('fetch, import, and delete failures preserve timestamp and release lock',()
  const {c,state}=context();
  if(kind==='fetch') c.Calendar.Events.list=()=>{throw Error('503');};
  else if(kind==='import') {c.findEvents=()=>[{id:'source',summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}}];c.Calendar.Events.import=()=>{throw Error('503');};}
- else {c.findEvents=()=>[{id:'source',status:'cancelled'}];c.Calendar.Events.list=()=>({items:[{id:'copy'}]});c.Calendar.Events.remove=()=>{throw Error('503');};}
- c.runSync();assert.equal(state.writes,0);assert.equal(state.released,1);
+ else {c.findEvents=()=>[{id:'source',status:'cancelled'}];c.Calendar.Events.list=()=>({items:[{id:'copy',extendedProperties:{private:{awaySource:'alice@example.com/source'}}}]});c.Calendar.Events.remove=()=>{throw Error('503');};}
+ assert.throws(()=>c.runSync(),/1 calendar\(s\) failed/);assert.equal(state.writes,0);assert.equal(state.released,1);
  }
 });
 test('empty pages do not produce undefined events',()=>{const {c}=context();assert.equal(c.findEvents('alice',new Date(),new Date(),null).length,0);});
@@ -78,7 +78,7 @@ test('inaccessible calendar does not block later users, and recovery retries',()
   if(email==='alice@example.com' && broken) throw Error('Not Found');
   return {items:[]};
  };
- c.runSync();assert.equal(state.properties[aliceKey],'2026-09-01T00:00:00.000Z');assert.ok(state.properties[bobKey]);
+ assert.throws(()=>c.runSync(),/1 calendar\(s\) failed/);assert.equal(state.properties[aliceKey],'2026-09-01T00:00:00.000Z');assert.ok(state.properties[bobKey]);
  const bobLast=state.properties[bobKey];broken=false;c.runSync();
  assert.equal(calls[2].since,'2026-09-01T00:00:00.000Z');assert.equal(calls[3].since,bobLast);
  assert.notEqual(state.properties[aliceKey],'2026-09-01T00:00:00.000Z');
@@ -86,7 +86,7 @@ test('inaccessible calendar does not block later users, and recovery retries',()
 test('second-page failure leaves calendar checkpoint unchanged',()=>{
  const {c,state}=context();let calls=0;
  c.Calendar.Events.list=()=>{if(++calls===2)throw Error('503');return {items:[],nextPageToken:'next'};};
- c.runSync();assert.equal(calls,2);assert.equal(state.writes,0);
+ assert.throws(()=>c.runSync(),/1 calendar\(s\) failed/);assert.equal(calls,2);assert.equal(state.writes,0);
 });
 test('full sync ignores stored checkpoints',()=>{
  const {c,state}=context();let since='unset';
@@ -95,5 +95,40 @@ test('full sync ignores stored checkpoints',()=>{
 });
 test('native RFC3339 formatting preserves UTC',()=>{
  const {c}=context();assert.equal(c.formatDateAsRFC3339(new Date('2026-09-12T00:00:00+02:00')),'2026-09-11T22:00:00.000Z');
+});
+test('many exclusions across users share one paginated lookup and log reasons',()=>{
+ const {c,state}=context();let lists=0;
+ c.getCalendarEditors=()=>['alice@example.com','bob@example.com'];
+ c.findEvents=()=>Array.from({length:100},(_,i)=>({...timed('2026-09-12T09:00:00Z','2026-09-12T11:00:00Z'),id:`source${i}`}));
+ c.Calendar.Events.get=()=>assert.fail('No per-event get expected');
+ c.Calendar.Events.list=(calendar,params)=>{
+  lists++;assert.equal(params.timeMin,undefined);assert.equal(params.timeMax,undefined);
+  return params.pageToken ? {items:[{id:'copy',summary:'[alice] Away',extendedProperties:{private:{awaySource:'alice@example.com/source0'}}}]} : {items:[],nextPageToken:'next'};
+ };
+ c.runSync();assert.equal(lists,2);assert.deepEqual(state.removed,['copy']);
+ assert.equal(state.logs.filter(line=>line.startsWith('Excluded or cancelled:')).length,200);
+ assert.ok(state.logs.some(line=>line.startsWith('Removed:')));
+});
+test('runs without exclusions never load destination calendar',()=>{
+ const {c}=context();c.findEvents=()=>[];c.Calendar.Events.list=()=>assert.fail('Unexpected destination lookup');c.runSync();
+});
+test('cleanup removes only legacy and departed-user state for this team',()=>{
+ const {c,state}=context();const prefix='lastRun:your-calendar-id@group.calendar.google.com:';
+ Object.assign(state.properties,{lastRun:'old',[prefix+'departed@example.com']:'old',[prefix+'alice@example.com']:'2026-09-01T00:00:00Z','lastRun:other-team:user':'keep',setting:'keep'});
+ c.runSync();assert.equal(state.properties.lastRun,undefined);assert.equal(state.properties[prefix+'departed@example.com'],undefined);
+ assert.ok(state.properties[prefix+'alice@example.com']);assert.equal(state.properties['lastRun:other-team:user'],'keep');assert.equal(state.properties.setting,'keep');
+});
+test('dry run and failed ACL read leave obsolete properties untouched',()=>{
+ for(const failACL of [false,true]) {
+ const {c,state}=context();state.properties.lastRun='old';
+ if(failACL){c.getCalendarEditors=()=>{throw Error('ACL unavailable');};assert.throws(()=>c.runSync(),/ACL unavailable/);}
+ else c.runSync({dryRun:true});
+ assert.equal(state.properties.lastRun,'old');assert.equal(state.writes,0);
+ }
+});
+test('tagged copies for another source are not removed by legacy fallback',()=>{
+ const {c,state}=context();c.findEvents=()=>[{id:'source',status:'cancelled'}];
+ c.Calendar.Events.list=()=>({items:[{id:'source',summary:'[alice] Away',extendedProperties:{private:{awaySource:'other@example.com/source'}}}]});
+ c.runSync();assert.equal(state.removed.length,0);
 });
 console.log(`${passed} tests passed`);

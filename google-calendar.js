@@ -126,6 +126,24 @@ function performSync(options) {
   const users = getCalendarEditors(TEAM_CALENDAR_ID);
   console.log(`Found ${users.length} team members with write access`);
 
+  if (!options.dryRun) {
+    const prefix = `lastRun:${TEAM_CALENDAR_ID}:`;
+    const activeKeys = new Set(users.map((email) => `${prefix}${email}`));
+    for (const key of Object.keys(properties.getProperties())) {
+      if (key === "lastRun" || (key.startsWith(prefix) && !activeKeys.has(key))) {
+        properties.deleteProperty(key);
+      }
+    }
+  }
+
+  // Load once, only if exclusions need reconciliation. No date bounds: a
+  // cancelled or rescheduled source can refer to a copy outside this window.
+  let importedEvents;
+  const getImportedEvents = () => {
+    if (!importedEvents) importedEvents = listImportedEvents();
+    return importedEvents;
+  };
+
   // For each user, finds events having one or more of the keywords in the event
   // summary in the specified date range. Imports each of those to the team
   // calendar.
@@ -144,7 +162,7 @@ function performSync(options) {
       const events = findEvents(
         email, today, maxDate, lastRun ? new Date(lastRun) : null,
       );
-      const result = syncUserEvents(email, events, strict, options.dryRun);
+      const result = syncUserEvents(email, events, strict, options.dryRun, getImportedEvents);
       count += result.count;
       skipped += result.skipped;
       if (!options.dryRun) {
@@ -160,16 +178,24 @@ function performSync(options) {
     `${options.dryRun ? "Would import" : "Imported"} ${count} events from completed calendars` +
       `, excluded or cancelled ${skipped}, failed calendars ${failed}`,
   );
+  if (failed) {
+    throw new Error(`${failed} calendar(s) failed; see log above`);
+  }
 }
 
 /** Sync one calendar; any failure leaves its checkpoint unchanged. */
-function syncUserEvents(email, events, strict, dryRun) {
+function syncUserEvents(email, events, strict, dryRun, getImportedEvents) {
   const username = email.split("@")[0];
   let count = 0;
   let skipped = 0;
   for (const event of events) {
     if (event.status === "cancelled" || (strict && !isStrictMatch(event))) {
-      removeImportedEvent(email, username, event, dryRun);
+      console.log(
+        "Excluded or cancelled: [%s] %s (%s; %s)",
+        username, event.summary || "(no title)", event.id,
+        event.status === "cancelled" ? "cancelled" : "not a strict match",
+      );
+      removeImportedEvent(email, username, event, dryRun, getImportedEvents());
       skipped++;
       continue;
     }
@@ -286,54 +312,56 @@ function eventLocalParts(boundary, timeZone) {
   return { date: match[1], time: match[2] };
 }
 
-/** Remove only copies identifiable as this script's imports. */
-function removeImportedEvent(email, username, event, dryRun) {
-  const sourceKey = `${email}/${event.id}`;
-  const candidates = new Map();
+/** Read the team calendar once and index copies for local matching. */
+function listImportedEvents() {
+  const index = { bySource: new Map(), byId: new Map(), byUID: new Map() };
+  const add = (map, key, event) => {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(event);
+  };
   let pageToken;
   do {
     const response = Calendar.Events.list(TEAM_CALENDAR_ID, {
-      privateExtendedProperty: `awaySource=${sourceKey}`,
-      pageToken,
+      pageToken, maxResults: 2500, showDeleted: false,
     });
-    for (const copy of response.items || []) candidates.set(copy.id, copy);
+    for (const copy of response.items || []) {
+      if (copy.status === "cancelled") continue;
+      const source = copy.extendedProperties && copy.extendedProperties.private;
+      add(index.bySource, source && source.awaySource, copy);
+      add(index.byId, copy.id, copy);
+      add(index.byUID, copy.iCalUID, copy);
+    }
     pageToken = response.nextPageToken;
   } while (pageToken);
+  return index;
+}
 
-  // Earlier versions sent the source ID but did not tag their imports.
-  // Try that ID first; imports may instead have a generated destination ID.
-  if (!candidates.size) {
-    let copy;
-    try {
-      copy = Calendar.Events.get(TEAM_CALENDAR_ID, event.id);
-    } catch (error) {
-      if (!/not found|gone|404|410/i.test(String(error))) throw error;
-    }
-    if (copy && (copy.summary || "").startsWith(`[${username}] `)) {
-      candidates.set(copy.id, copy);
-    }
+/** Remove only copies identifiable as this script's imports. */
+function removeImportedEvent(email, username, event, dryRun, index) {
+  let candidates = index.bySource.get(`${email}/${event.id}`) || [];
+  // Legacy copies have no source tag. Retain the ID/UID and title checks,
+  // without making requests for each excluded source event.
+  const isLegacyCopy = (copy) =>
+    !(copy.extendedProperties && copy.extendedProperties.private &&
+      copy.extendedProperties.private.awaySource) &&
+    (copy.summary || "").startsWith(`[${username}] `);
+  if (!candidates.length) {
+    candidates = (index.byId.get(event.id) || []).filter(isLegacyCopy);
   }
-  if (!candidates.size && event.iCalUID && !event.recurringEventId) {
-    do {
-      const response = Calendar.Events.list(TEAM_CALENDAR_ID, {
-        iCalUID: event.iCalUID,
-        pageToken,
-      });
-      for (const copy of response.items || []) {
-        if (!copy.recurringEventId &&
-            (copy.summary || "").startsWith(`[${username}] `)) {
-          candidates.set(copy.id, copy);
-        }
-      }
-      pageToken = response.nextPageToken;
-    } while (pageToken);
+  if (!candidates.length && event.iCalUID && !event.recurringEventId) {
+    candidates = (index.byUID.get(event.iCalUID) || []).filter(
+      (copy) => !copy.recurringEventId && isLegacyCopy(copy),
+    );
   }
-  for (const copy of candidates.values()) {
+  for (const copy of candidates) {
     if (copy.status === "cancelled") continue;
     if (dryRun) {
-      console.log("Would remove: %s", copy.summary);
+      console.log("Would remove: %s (%s)", copy.summary, copy.id);
     } else {
       Calendar.Events.remove(TEAM_CALENDAR_ID, copy.id);
+      copy.status = "cancelled";
+      console.log("Removed: %s (%s)", copy.summary, copy.id);
     }
   }
 }
