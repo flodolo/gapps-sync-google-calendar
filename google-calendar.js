@@ -1,608 +1,487 @@
-// Based on: https://developers.google.com/apps-script/samples/automations/vacation-calendar
-//
-// Copyright 2022 Google LLC
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//
-//
-// FJoseph Sep 10 2026: This code has been updated with Claude to fix a few issues
-// 1. Enable teams across multiple timezones so events >= 12 hours are seen as all-day events
-// 2. Optimization on string conversion
-// 3. Pin V8 runtime and Google Calendar API library requirements
+// To learn how to use this script, refer to the documentation:
+// https://developers.google.com/apps-script/samples/automations/vacation-calendar
 
-/* ------------------------------------------------------------------ *
- * Configuration
- * ------------------------------------------------------------------ */
+/*
+Copyright 2022 Google LLC
 
-// The team calendar to write to. Find the ID on the calendar's settings page.
-const TEAM_CALENDAR_ID = 'your-other-calendar-id@group.calendar.google.com';
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-// A single Google Group email, or an array of them:
-//   const GROUP_EMAIL = ['team-a@example.com', 'team-b@example.com'];
-// Keep each group under ~500 members to avoid timeouts.
-const GROUP_EMAIL = 'addons-core-team@mozilla.com';
+    https://www.apache.org/licenses/LICENSE-2.0
 
-// true  = only direct members of the group(s)
-// false = direct members plus members of nested groups
-const ONLY_DIRECT_MEMBERS = false;
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
+// Set the ID of the team calendar to add events to. You can find the calendar's
+// ID on the settings page.
+const TEAM_CALENDAR_ID = "your-calendar-id@group.calendar.google.com";
+// Calendar ACL roles that identify a team member. 'writer' is "Make changes to
+// events", 'owner' is "Make changes and manage sharing".
+const MEMBER_ROLES = ["writer", "owner"];
+
+const KEYWORDS = ['vacation', 'ooo', 'pto', 'wellness', 'holiday', 'on leave'];
 const MONTHS_IN_ADVANCE = 3;
 
-// --- What gets imported ------------------------------------------- //
+// When true, timed out-of-office events are imported only if their title
+// contains one of KEYWORDS; all-day events are always imported. When false,
+// every out-of-office event in the window is imported.
+const STRICT_MATCH = true;
 
-// An event is a candidate if its title contains one of these anywhere,
-// case-insensitively.
-const KEYWORDS = ['vacation', 'ooo', 'pto', 'wellness', 'holiday', 'on leave'];
-
-// Also treat Google's native "Out of office" entries as candidates,
-// regardless of their title.
-const INCLUDE_OUT_OF_OFFICE_EVENTS = true;
-
-// --- Full-day rule ------------------------------------------------- //
-
-// Candidates must resolve to a full day. Events already marked all-day
-// always qualify. Timed events qualify only at or above this duration,
-// and are rewritten as all-day so they read correctly in every timezone.
-const ALL_DAY_MIN_HOURS = 12;
-
-// Append the original local times to the description when a long timed
-// event is converted to all-day.
-const NOTE_ORIGINAL_TIMES = true;
-
-// --- Deletions ----------------------------------------------------- //
-
-// Remove the team-calendar entry when the source event is deleted.
-const PROPAGATE_DELETIONS = true;
-
-// --- Timezones ----------------------------------------------------- //
-
-// Used when a member's calendar timezone cannot be read. UTC is the
-// least-wrong default for a distributed team; using the script timezone
-// biases day boundaries toward one region.
-const FALLBACK_TIME_ZONE = 'Etc/UTC';
-
-// Manual overrides for members whose calendars are not readable.
-// Keys are email addresses, values are IANA timezone ids.
-const MEMBER_TIME_ZONES = {
-  // 'kenji@example.com': 'Asia/Tokyo',
-  // 'anna@example.com': 'Europe/Berlin',
-};
-
-/* ------------------------------------------------------------------ *
- * Constants
- * ------------------------------------------------------------------ */
-
-const MS_PER_HOUR = 60 * 60 * 1000;
-const LAST_RUN_KEY = 'lastRun';
-
-// Re-examine a few minutes either side of the last run so that events
-// modified while the previous execution was in flight are not missed.
-const SYNC_OVERLAP_MS = 5 * 60 * 1000;
-
-/** @type {!Map<string, string>} Per-execution timezone cache. */
-const timeZoneCache = new Map();
-
-/* ------------------------------------------------------------------ *
- * Setup and maintenance
- * ------------------------------------------------------------------ */
+// When true, the original event title, description and location are discarded
+// and the imported event is titled '[username] Away'. Keeps private details
+// from personal calendars off the shared team calendar.
+const SANITIZE_EVENTS = true;
+const SANITIZED_TITLE = "Away";
 
 /**
- * Sets up the script to run automatically every hour.
+ * Sets up the script to run automatically: an hourly incremental sync, plus a
+ * nightly full sync that re-scans the whole window.
  */
 function setup() {
   const triggers = ScriptApp.getProjectTriggers();
   if (triggers.length > 0) {
-    throw new Error('Triggers are already set up. Run removeTriggers() first.');
+    throw new Error("Triggers are already setup.");
   }
-  ScriptApp.newTrigger('sync').timeBased().everyHours(1).create();
-  sync(); // Run the first sync immediately.
+  ScriptApp.newTrigger("sync").timeBased().everyHours(1).create();
+  ScriptApp.newTrigger("fullSync").timeBased().everyDays(1).atHour(3).create();
+  // Runs the first sync immediately.
+  fullSync();
 }
 
 /**
- * Deletes every trigger owned by this project.
- */
-function removeTriggers() {
-  for (const trigger of ScriptApp.getProjectTriggers()) {
-    ScriptApp.deleteTrigger(trigger);
-  }
-  console.log('All triggers removed.');
-}
-
-/**
- * Clears the incremental-sync watermark so the next run re-imports the full
- * date range. Run this after changing KEYWORDS or ALL_DAY_MIN_HOURS.
- */
-function resetLastRun() {
-  PropertiesService.getScriptProperties().deleteProperty(LAST_RUN_KEY);
-  console.log('lastRun cleared. The next sync will do a full import.');
-}
-
-/**
- * Prints match results for sample titles, without touching any calendar.
- * Run this after editing KEYWORDS.
- */
-function testKeywordMatching() {
-  const samples = [
-    'Vacation', 'PTO', 'PTO/Vacation', 'OOO', 'On leave', 'Holidays',
-    'Wellness day', 'Annual holiday - Spain', 'Team standup', 'Design review',
-  ];
-  for (const summary of samples) {
-    console.log('%s  %s',
-      matchesKeyword({ summary: summary }) ? 'MATCH' : 'skip ', summary);
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * Main sync
- * ------------------------------------------------------------------ */
-
-/**
- * Looks through the group members' calendars and copies qualifying leave
- * events into the shared team calendar.
+ * Looks through the calendars of everyone with write access to the team
+ * calendar and adds any 'vacation' or 'out of office' events to it.
  */
 function sync() {
-  const runStartedAt = new Date();
+  // Note: no parameters. Time-based triggers pass an event object as the first
+  // argument, so options go through runSync() instead.
+  runSync({});
+}
 
-  const maxDate = new Date(runStartedAt.getTime());
-  maxDate.setMonth(maxDate.getMonth() + MONTHS_IN_ADVANCE);
+/**
+ * Re-scans the entire window, ignoring the time of the last run. Catches events
+ * that were created outside the window and slid into it without being modified
+ * since, which the incremental sync() would never see.
+ */
+function fullSync() {
+  runSync({ ignoreLastRun: true });
+}
 
-  const lastRun = readLastRun();
+/**
+ * Dry run over a short window: lists what would be imported without writing
+ * anything to the team calendar, and without touching the 'lastRun' property.
+ * Run this manually from the editor to test the configuration.
+ */
+function testSync() {
+  runSync({ daysAhead: 7, dryRun: true, ignoreLastRun: true });
+}
 
-  const users = getTeamMembers();
-  console.log('Syncing %s team member(s).', users.length);
+/**
+ * Performs the sync.
+ * @param {Object} options Optional settings.
+ * @param {number} options.daysAhead Look this many days ahead instead of
+ *     MONTHS_IN_ADVANCE months.
+ * @param {boolean} options.dryRun Log events instead of importing them, and
+ *     leave 'lastRun' untouched.
+ * @param {boolean} options.ignoreLastRun Scan the whole window rather than only
+ *     events modified since the last run.
+ * @param {boolean} options.strictMatch Overrides the STRICT_MATCH constant.
+ */
+function runSync(options) {
+  // Defines the calendar event date range to search.
+  const today = new Date();
+  const maxDate = new Date();
+  if (options.daysAhead) {
+    maxDate.setDate(maxDate.getDate() + options.daysAhead);
+  } else {
+    maxDate.setMonth(maxDate.getMonth() + MONTHS_IN_ADVANCE);
+  }
+  console.log(
+    "Window: %s to %s%s",
+    formatDateAsRFC3339(today),
+    formatDateAsRFC3339(maxDate),
+    options.dryRun ? " (dry run)" : "",
+  );
 
-  let imported = 0;
-  let removed = 0;
-  let ignored = 0;
+  // Determines the time the the script was last run.
+  let lastRun = options.ignoreLastRun
+    ? null
+    : PropertiesService.getScriptProperties().getProperty("lastRun");
+  lastRun = lastRun ? new Date(lastRun) : null;
 
-  for (const user of users) {
-    const email = user.getEmail();
-    const username = email.split('@')[0];
+  // Gets the list of people with write access to the team calendar.
+  const users = getCalendarEditors(TEAM_CALENDAR_ID);
+  console.log(`Found ${users.length} team members with write access`);
 
-    const events = findEvents(user, runStartedAt, maxDate, lastRun);
-    if (events.length === 0) {
-      continue;
-    }
+  // For each user, finds events having one or more of the keywords in the event
+  // summary in the specified date range. Imports each of those to the team
+  // calendar.
+  const strict =
+    options.strictMatch === undefined ? STRICT_MATCH : options.strictMatch;
 
-    // Only look up the timezone for members who actually have events.
-    const userTimeZone = getUserTimeZone(email);
-
+  let count = 0;
+  let skipped = 0;
+  for (const email of users) {
+    const username = email.split("@")[0];
+    const events = findEvents(email, today, maxDate, lastRun);
     for (const event of events) {
-      const decision = classifyEvent(event, userTimeZone);
-
-      if (decision.action === 'import') {
-        if (importEvent(username, event, decision.span)) {
-          imported++;
+      if (strict && !isStrictMatch(event)) {
+        console.log(
+          "Skipping (not a strict match): [%s] %s",
+          username,
+          event.summary,
+        );
+        skipped++;
+        continue;
+      }
+      if (options.dryRun) {
+        const summary = buildSummary(username, event);
+        if (isAllDayEvent(event)) {
+          convertToAllDay(event);
+          console.log(
+            "Would import: %s (all day, %s to %s exclusive)",
+            summary,
+            event.start.date,
+            event.end.date,
+          );
         } else {
-          ignored++;
-        }
-      } else if (decision.action === 'delete') {
-        if (removeFromTeamCalendar(event)) {
-          removed++;
-        } else {
-          ignored++;
+          console.log(
+            "Would import: %s (%s)",
+            summary,
+            event.start.dateTime,
+          );
         }
       } else {
-        ignored++;
+        importEvent(username, event);
       }
+      count++;
     }
   }
 
-  // Store as an ISO 8601 string. Never store a Date object directly:
-  // setProperty() coerces it with toString(), and re-parsing that format
-  // is not guaranteed across runtime versions.
-  PropertiesService.getScriptProperties()
-    .setProperty(LAST_RUN_KEY, runStartedAt.toISOString());
-
-  console.log('Imported %s, removed %s, ignored %s.', imported, removed, ignored);
+  if (!options.dryRun) {
+    PropertiesService.getScriptProperties().setProperty("lastRun", today);
+  }
+  console.log(
+    `${options.dryRun ? "Would import" : "Imported"} ${count} events` +
+    (strict ? `, skipped ${skipped} non-matching` : ""),
+  );
 }
 
 /**
- * Reads the stored watermark, tolerating a missing or unparseable value.
- * @return {?Date} The adjusted watermark, or null for a full sync.
+ * Builds the title for the imported event: '[username] Away' when
+ * SANITIZE_EVENTS is on, otherwise the original title prefixed with the
+ * username.
+ * @param {string} username The team member the event belongs to.
+ * @param {Calendar.Event} event The source event.
+ * @return {string} The title to use on the team calendar.
  */
-function readLastRun() {
-  const raw = PropertiesService.getScriptProperties().getProperty(LAST_RUN_KEY);
-  if (!raw) {
-    return null;
-  }
-  const parsed = new Date(raw);
-  if (isNaN(parsed.getTime())) {
-    console.warn('Unparseable lastRun value "%s". Falling back to a full sync.', raw);
-    return null;
-  }
-  return new Date(parsed.getTime() - SYNC_OVERLAP_MS);
-}
-
-/* ------------------------------------------------------------------ *
- * Classification
- * ------------------------------------------------------------------ */
-
-/**
- * Decides what to do with a source event.
- * @param {!Object} event The event resource.
- * @param {string} timeZone Fallback IANA timezone for the member.
- * @return {{action: string, span: (Object|undefined), reason: (string|undefined)}}
- */
-function classifyEvent(event, timeZone) {
-  if (event.status === 'cancelled') {
-    if (!PROPAGATE_DELETIONS) {
-      return { action: 'ignore', reason: 'cancelled' };
-    }
-    // Skip the team-calendar lookup when we can prove it was never imported.
-    // Cancelled stubs often carry no summary, in which case we must check.
-    const couldHaveBeenImported =
-      !event.summary ||
-      matchesKeyword(event) ||
-      (INCLUDE_OUT_OF_OFFICE_EVENTS && event.eventType === 'outOfOffice');
-    if (!couldHaveBeenImported) {
-      return { action: 'ignore', reason: 'cancelled, never imported' };
-    }
-    return { action: 'delete' };
-  }
-
-  const isOutOfOffice =
-    INCLUDE_OUT_OF_OFFICE_EVENTS && event.eventType === 'outOfOffice';
-  if (!isOutOfOffice && !matchesKeyword(event)) {
-    return { action: 'ignore', reason: 'no keyword, not out-of-office' };
-  }
-
-  if (!event.start || !event.end) {
-    return { action: 'ignore', reason: 'no start/end' };
-  }
-
-  const span = resolveAllDaySpan(event, timeZone);
-  if (!span) {
-    return { action: 'ignore', reason: `under ${ALL_DAY_MIN_HOURS}h` };
-  }
-  return { action: 'import', span: span };
+function buildSummary(username, event) {
+  const title = SANITIZE_EVENTS ? SANITIZED_TITLE : event.summary;
+  return `[${username}] ${title}`;
 }
 
 /**
- * @param {!Object} event An event resource.
- * @return {boolean} True if the title contains one of KEYWORDS.
+ * Decides whether an event qualifies under STRICT_MATCH: all-day events are
+ * always kept, while timed events are kept only if their title contains one of
+ * KEYWORDS.
+ * @param {Calendar.Event} event The event to test.
+ * @return {boolean} True if the event should be imported.
  */
-function matchesKeyword(event) {
-  const summary = (event.summary || '').toLowerCase();
-  if (!summary) {
-    return false;
+function isStrictMatch(event) {
+  if (isAllDayEvent(event)) {
+    return true;
   }
-  return KEYWORDS.some((keyword) => summary.includes(keyword.toLowerCase()));
+  const summary = (event.summary || "").toLowerCase();
+  return KEYWORDS.some((keyword) => summary.includes(keyword));
 }
 
 /**
- * Resolves an event to an all-day span, or null if it does not qualify.
- *
- * Day boundaries are computed in the event owner's timezone, so a member in
- * Tokyo taking Monday off produces a Monday entry no matter where the viewer
- * is. The resulting all-day event carries no timezone at all.
- *
- * @param {!Object} event The event resource.
- * @param {string} defaultTimeZone Fallback IANA timezone.
- * @return {?Object} The span, or null if the event is too short.
+ * Rewrites an event that covers whole days as a date-only all-day event, in
+ * place. Google's all-day end date is exclusive, so an event ending at midnight
+ * (or 23:59) on the last day becomes an end date of the following day.
+ * @param {Calendar.Event} event The event to rewrite.
  */
-function resolveAllDaySpan(event, defaultTimeZone) {
-  // Already all-day: the Calendar API represents these with `date`
-  // rather than `dateTime`.
+function convertToAllDay(event) {
   if (event.start.date) {
-    return {
-      start: { date: event.start.date },
-      end: { date: event.end.date },
-      converted: false,
-    };
+    // Already a date-only event.
+    return;
   }
+  const timeZone = event.start.timeZone || Session.getScriptTimeZone();
+  const start = new Date(event.start.dateTime);
+  const end = new Date(event.end.dateTime);
 
-  const timeZone = event.start.timeZone || defaultTimeZone;
-  const startTime = new Date(event.start.dateTime);
-  const endTime = new Date(event.end.dateTime);
-  if (isNaN(startTime.getTime()) || isNaN(endTime.getTime())) {
-    return null;
-  }
+  const startDate = Utilities.formatDate(start, timeZone, "yyyy-MM-dd");
+  // Step back a second so an end of midnight counts as the previous day, then
+  // add one day to get the exclusive end date.
+  const lastDay = Utilities.formatDate(
+    new Date(end.getTime() - 1000),
+    timeZone,
+    "yyyy-MM-dd",
+  );
+  const parts = lastDay.split("-");
+  const exclusiveEnd = new Date(
+    Date.UTC(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])),
+  );
+  exclusiveEnd.setUTCDate(exclusiveEnd.getUTCDate() + 1);
 
-  const durationHours = (endTime.getTime() - startTime.getTime()) / MS_PER_HOUR;
-  if (durationHours < ALL_DAY_MIN_HOURS) {
-    return null;
-  }
-
-  const startDay = formatDayKey(startTime, timeZone);
-
-  // All-day events use an EXCLUSIVE end date. An event finishing at 18:00 on
-  // the 5th ends on the 6th; one finishing at exactly midnight on the 6th
-  // already ends on the 6th.
-  let endDay = formatDayKey(endTime, timeZone);
-  if (!isLocalMidnight(endTime, timeZone)) {
-    endDay = shiftDayKey(endDay, 1);
-  }
-  if (endDay <= startDay) { // ISO date strings compare correctly as strings.
-    endDay = shiftDayKey(startDay, 1);
-  }
-
-  return {
-    start: { date: startDay },
-    end: { date: endDay },
-    converted: true,
-    timeZone: timeZone,
-    originalStart: startTime,
-    originalEnd: endTime,
+  event.start = { date: startDate };
+  event.end = {
+    date: Utilities.formatDate(exclusiveEnd, "UTC", "yyyy-MM-dd"),
   };
 }
 
-/* ------------------------------------------------------------------ *
- * Writing to the team calendar
- * ------------------------------------------------------------------ */
+/**
+ * Decides whether an event covers whole days. Ordinary all-day events use a
+ * date-only 'date' field, but out-of-office events always carry a 'dateTime'
+ * even when created as full-day, so those are detected by checking that they
+ * start at midnight and run for at least a full day.
+ * @param {Calendar.Event} event The event to test.
+ * @return {boolean} True if the event covers one or more whole days.
+ */
+function isAllDayEvent(event) {
+  if (!event.start || !event.end) {
+    return false;
+  }
+  if (event.start.date) {
+    return true;
+  }
+  if (!event.start.dateTime || !event.end.dateTime) {
+    return false;
+  }
+  const start = new Date(event.start.dateTime);
+  const end = new Date(event.end.dateTime);
+  const timeZone = event.start.timeZone || Session.getScriptTimeZone();
+  const startsAtMidnight =
+    Utilities.formatDate(start, timeZone, "HH:mm") === "00:00";
+  // Allow a little slack: some clients end the day at 23:59 instead of 00:00.
+  const durationHours = (end.getTime() - start.getTime()) / (1000 * 60 * 60);
+  return startsAtMidnight && durationHours >= 23;
+}
 
 /**
- * Imports one qualifying event into the team calendar.
- * @param {string} username The team member attending the event.
- * @param {!Object} event The event resource to import.
- * @param {!Object} span The all-day span from resolveAllDaySpan().
- * @return {boolean} True if the event was imported.
+ * Imports the given event from the user's calendar into the shared team
+ * calendar.
+ * @param {string} username The team member that is attending the event.
+ * @param {Calendar.Event} event The event to import.
  */
-function importEvent(username, event, span) {
-  event.summary = `[${username}] ${event.summary || 'Out of office'}`;
-  event.organizer = { id: TEAM_CALENDAR_ID };
+function importEvent(username, event) {
+  event.summary = buildSummary(username, event);
+  if (SANITIZE_EVENTS) {
+    // Personal calendars can hold details the team calendar should not expose.
+    event.description = undefined;
+    event.location = undefined;
+  }
+  // Full-day out-of-office events are stored with a 'dateTime', so they would
+  // land on the team calendar as timed 00:00-23:59 blocks. Rewrite them as real
+  // all-day events.
+  if (isAllDayEvent(event)) {
+    convertToAllDay(event);
+  }
+  event.organizer = {
+    id: TEAM_CALENDAR_ID,
+  };
   event.attendees = [];
 
-  // Prevent the shared calendar from notifying every subscriber.
-  event.reminders = { useDefault: false, overrides: [] };
-
-  // Only 'default' events can be imported.
-  if (event.eventType !== 'default') {
-    event.eventType = 'default';
+  // If the event is not of type 'default', it can't be imported, so it needs
+  // to be changed.
+  if (event.eventType !== "default") {
+    event.eventType = "default";
     event.outOfOfficeProperties = undefined;
     event.focusTimeProperties = undefined;
   }
 
-  if (span.converted && NOTE_ORIGINAL_TIMES) {
-    const note = `Original time: ${formatLocal(span.originalStart, span.timeZone)} – ` +
-      `${formatLocal(span.originalEnd, span.timeZone)} (${span.timeZone})`;
-    event.description = event.description ?
-      `${event.description}\n\n${note}` : note;
-  }
-
-  event.start = span.start;
-  event.end = span.end;
-
-  // A recurring instance's originalStartTime must use the same format,
-  // otherwise the import is rejected.
-  if (span.converted && event.originalStartTime &&
-    event.originalStartTime.dateTime) {
-    const original = new Date(event.originalStartTime.dateTime);
-    if (!isNaN(original.getTime())) {
-      event.originalStartTime = { date: formatDayKey(original, span.timeZone) };
-    }
-  }
-
-  console.log('Importing: %s (%s to %s)',
-    event.summary, span.start.date, span.end.date);
+  console.log("Importing: %s", event.summary);
   try {
     Calendar.Events.import(event, TEAM_CALENDAR_ID);
-    return true;
   } catch (e) {
-    console.error('Error importing "%s": %s. Skipping.',
-      event.summary, e.toString());
-    return false;
+    console.error(
+      "Error attempting to import event: %s. Skipping.",
+      e.toString(),
+    );
   }
 }
 
 /**
- * Removes the team-calendar copy of a deleted source event, matched on
- * iCalUID, which Events.import preserves.
- * @param {!Object} event The cancelled source event.
- * @return {boolean} True if something was removed.
+ * In a given user's calendar, looks for occurrences of the given keyword
+ * in events within the specified date range and returns any such events
+ * found.
+ * @param {string} email The email address of the user to retrieve events for.
+ * @param {Date} start The starting date of the range to examine.
+ * @param {Date} end The ending date of the range to examine.
+ * @param {Date} optSince A date indicating the last time this script was run.
+ * @return {Calendar.Event[]} An array of calendar events.
  */
-function removeFromTeamCalendar(event) {
-  if (!event.iCalUID) {
-    return false;
-  }
-  try {
-    const response = Calendar.Events.list(TEAM_CALENDAR_ID, {
-      iCalUID: event.iCalUID,
-      showDeleted: false,
-      maxResults: 10,
-    });
-    const items = response.items || [];
-    for (const item of items) {
-      Calendar.Events.remove(TEAM_CALENDAR_ID, item.id);
-      console.log('Removed: %s', item.summary);
-    }
-    return items.length > 0;
-  } catch (e) {
-    console.error('Error removing event %s: %s', event.iCalUID, e.toString());
-    return false;
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * Reading member calendars
- * ------------------------------------------------------------------ */
-
-/**
- * Returns every event in a member's calendar within the date range.
- * Filtering happens locally in classifyEvent(), because the API cannot
- * filter on duration and one unfiltered call is cheaper than several
- * narrower ones.
- * @param {!GroupsApp.User} user The member to read events for.
- * @param {!Date} start The start of the range.
- * @param {!Date} end The end of the range.
- * @param {?Date} optSince Only return events modified since this time.
- * @return {!Array<!Object>} Event resources.
- */
-function findEvents(user, start, end, optSince) {
+function findEvents(email, start, end, optSince) {
   const params = {
+    eventTypes: "outOfOffice",
     timeMin: formatDateAsRFC3339(start),
     timeMax: formatDateAsRFC3339(end),
-    showDeleted: PROPAGATE_DELETIONS,
-    maxResults: 250,
+    showDeleted: true,
   };
   if (optSince) {
-    // Skips events that have not been modified since the last run.
+    // This prevents the script from examining events that have not been
+    // modified since the specified date (that is, the last time the
+    // script was run).
     params.updatedMin = formatDateAsRFC3339(optSince);
   }
-  return listAllEvents(user.getEmail(), params);
-}
-
-/**
- * Pages through Calendar.Events.list, collecting every result.
- * @param {string} email The calendar to read.
- * @param {!Object} params Query parameters.
- * @return {!Array<!Object>} Event resources.
- */
-function listAllEvents(email, params) {
-  const events = [];
   let pageToken = null;
+  let events = [];
   do {
-    const request = Object.assign({}, params, { pageToken: pageToken });
+    params.pageToken = pageToken;
     let response;
     try {
-      response = Calendar.Events.list(email, request);
+      response = Calendar.Events.list(email, params);
     } catch (e) {
-      console.error('Error retrieving events for %s: %s. Skipping remaining pages.',
-        email, e.toString());
-      break; // Never `continue` here: pageToken is unchanged, so it would loop forever.
+      console.error(
+        "Error retrieving events for %s: %s; skipping",
+        email,
+        e.toString(),
+      );
+      break;
     }
-    for (const item of (response.items || [])) {
-      events.push(item);
-    }
+    events = events.concat(response.items);
     pageToken = response.nextPageToken;
   } while (pageToken);
   return events;
 }
 
 /**
- * Returns the IANA timezone of a member's calendar, falling back to a manual
- * override and then to FALLBACK_TIME_ZONE.
- * @param {string} email The member's email address.
- * @return {string} An IANA timezone id.
- */
-function getUserTimeZone(email) {
-  if (timeZoneCache.has(email)) {
-    return timeZoneCache.get(email);
-  }
-
-  let timeZone = MEMBER_TIME_ZONES[email] || null;
-
-  if (!timeZone) {
-    try {
-      timeZone = Calendar.Calendars.get(email).timeZone;
-    } catch (e) {
-      console.warn('Could not read the timezone for %s (%s); using %s. ' +
-        'Add an entry to MEMBER_TIME_ZONES if that is wrong.',
-        email, e.message, FALLBACK_TIME_ZONE);
-    }
-  }
-
-  timeZone = timeZone || FALLBACK_TIME_ZONE;
-  timeZoneCache.set(email, timeZone);
-  return timeZone;
-}
-
-/* ------------------------------------------------------------------ *
- * Group membership
- * ------------------------------------------------------------------ */
-
-/**
- * Resolves the configured group(s) into a deduplicated member list.
- * @return {!Array<!GroupsApp.User>} The team members.
- */
-function getTeamMembers() {
-  const groupEmails = Array.isArray(GROUP_EMAIL) ? GROUP_EMAIL : [GROUP_EMAIL];
-
-  const users = [];
-  const seen = new Set();
-  for (const groupEmail of groupEmails) {
-    const members = ONLY_DIRECT_MEMBERS ?
-      GroupsApp.getGroupByEmail(groupEmail).getUsers() :
-      getAllMembers(groupEmail);
-    for (const user of members) {
-      const email = user.getEmail();
-      if (!seen.has(email)) {
-        seen.add(email);
-        users.push(user);
-      }
-    }
-  }
-  return users;
-}
-
-/**
- * Returns direct and indirect members of a group.
- * @param {string} groupEmail The group's email address.
- * @param {!Set<string>=} visited Groups already expanded, to stop cycles.
- * @return {!Array<!GroupsApp.User>} The members.
- */
-function getAllMembers(groupEmail, visited) {
-  visited = visited || new Set();
-  if (visited.has(groupEmail)) {
-    return []; // Nested groups can reference each other in a cycle.
-  }
-  visited.add(groupEmail);
-
-  const group = GroupsApp.getGroupByEmail(groupEmail);
-  let users = group.getUsers();
-  for (const childGroup of group.getGroups()) {
-    users = users.concat(getAllMembers(childGroup.getEmail(), visited));
-  }
-  return users;
-}
-
-/* ------------------------------------------------------------------ *
- * Date helpers
- * ------------------------------------------------------------------ */
-
-/**
- * @param {!Date} date The instant to format.
- * @param {string} timeZone An IANA timezone id.
- * @return {string} The calendar date in that zone, as yyyy-MM-dd.
- */
-function formatDayKey(date, timeZone) {
-  return Utilities.formatDate(date, timeZone, 'yyyy-MM-dd');
-}
-
-/**
- * Adds or subtracts whole days from a yyyy-MM-dd string. The arithmetic is
- * done in UTC so that DST transitions cannot shift it.
- * @param {string} dayKey A yyyy-MM-dd date string.
- * @param {number} days The number of days to add.
- * @return {string} The shifted yyyy-MM-dd string.
- */
-function shiftDayKey(dayKey, days) {
-  const parts = dayKey.split('-');
-  const date = new Date(Date.UTC(
-    Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])));
-  date.setUTCDate(date.getUTCDate() + days);
-  return Utilities.formatDate(date, 'UTC', 'yyyy-MM-dd');
-}
-
-/**
- * @param {!Date} date The instant to test.
- * @param {string} timeZone An IANA timezone id.
- * @return {boolean} True if the instant is midnight in that zone.
- */
-function isLocalMidnight(date, timeZone) {
-  return Utilities.formatDate(date, timeZone, 'HH:mm:ss') === '00:00:00';
-}
-
-/**
- * @param {!Date} date The instant to format.
- * @param {string} timeZone An IANA timezone id.
- * @return {string} A human-readable local timestamp.
- */
-function formatLocal(date, timeZone) {
-  return Utilities.formatDate(date, timeZone, 'EEE d MMM yyyy HH:mm');
-}
-
-/**
- * @param {!Date} date The date to format.
- * @return {string} An RFC 3339 timestamp in UTC.
+ * Returns an RFC3339 formated date String corresponding to the given
+ * Date object.
+ * @param {Date} date a Date.
+ * @return {string} a formatted date string.
  */
 function formatDateAsRFC3339(date) {
-  return Utilities.formatDate(date, 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'");
+  return Utilities.formatDate(date, "UTC", "yyyy-MM-dd'T'HH:mm:ssZ");
+}
+
+/**
+ * Diagnostic helper: dumps the raw start/end of every out-of-office event in
+ * the next 30 days, with the verdict of the all-day and strict-match checks.
+ * Run this manually to confirm the filters behave as expected.
+ */
+function inspectEvents() {
+  const today = new Date();
+  const maxDate = new Date();
+  maxDate.setDate(maxDate.getDate() + 30);
+
+  for (const email of getCalendarEditors(TEAM_CALENDAR_ID)) {
+    const events = findEvents(email, today, maxDate, null);
+    console.log("%s: %s events", email, events.length);
+    for (const event of events) {
+      console.log(
+        "  %s\n    start=%s end=%s tz=%s\n    allDay=%s strictMatch=%s",
+        event.summary,
+        JSON.stringify(event.start),
+        JSON.stringify(event.end),
+        event.start.timeZone || "(none)",
+        isAllDayEvent(event),
+        isStrictMatch(event),
+      );
+    }
+  }
+}
+
+/**
+ * Diagnostic helper: checks whether TEAM_CALENDAR_ID is reachable by the
+ * account running the script, and with which access role. Run this manually
+ * when acl.list returns 'Not Found'.
+ */
+function diagnoseCalendarAccess() {
+  console.log("Running as: %s", Session.getEffectiveUser().getEmail());
+  console.log("TEAM_CALENDAR_ID: %s", TEAM_CALENDAR_ID);
+
+  let entry;
+  try {
+    entry = Calendar.CalendarList.get(TEAM_CALENDAR_ID);
+  } catch (e) {
+    console.error(
+      "The calendar is not in this account's calendar list: %s",
+      e.toString(),
+    );
+    console.log("Calendars this account can see:");
+    let pageToken = null;
+    do {
+      const list = Calendar.CalendarList.list({ pageToken: pageToken });
+      for (const cal of list.items) {
+        console.log("  %s — %s (%s)", cal.summary, cal.id, cal.accessRole);
+      }
+      pageToken = list.nextPageToken;
+    } while (pageToken);
+    return;
+  }
+
+  console.log("Found '%s' with accessRole '%s'", entry.summary, entry.accessRole);
+  if (entry.accessRole !== "owner") {
+    console.warn(
+      "acl.list requires accessRole 'owner'; '%s' is not enough.",
+      entry.accessRole,
+    );
+  }
+}
+
+/**
+ * Diagnostic helper: logs every ACL entry of the team calendar, grouped by
+ * role. Run this manually from the editor to check who administers the
+ * calendar and which entries the sync will skip.
+ */
+function listCalendarAccess() {
+  const byRole = {};
+  let pageToken = null;
+  do {
+    const response = Calendar.Acl.list(TEAM_CALENDAR_ID, {
+      pageToken: pageToken,
+    });
+    for (const rule of response.items) {
+      const entry = `${rule.scope.value || "(everyone)"} [${rule.scope.type}]`;
+      (byRole[rule.role] = byRole[rule.role] || []).push(entry);
+    }
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+
+  // 'owner' is "Make changes and manage sharing", that is, the admins.
+  for (const role of Object.keys(byRole).sort()) {
+    console.log("%s (%s):\n  %s", role, byRole[role].length, byRole[role].join("\n  "));
+  }
+}
+
+/**
+ * Gets the email addresses of the individual users that have write access
+ * ("Make changes to events" or "Make changes and manage sharing") to the given
+ * calendar. Group, domain and public ACL entries are ignored, as are entries
+ * pointing at the team calendar itself.
+ * @param {string} calendarId The ID of the calendar to read the ACL of.
+ * @return {string[]} An array of unique email addresses.
+ */
+function getCalendarEditors(calendarId) {
+  const emails = new Set();
+  let pageToken = null;
+  do {
+    const response = Calendar.Acl.list(calendarId, { pageToken: pageToken });
+    for (const rule of response.items) {
+      if (!MEMBER_ROLES.includes(rule.role)) {
+        continue;
+      }
+      if (rule.scope.type !== "user") {
+        console.log(
+          "Skipping non-user ACL entry: %s (%s)",
+          rule.scope.value,
+          rule.scope.type,
+        );
+        continue;
+      }
+      // The team calendar is usually listed as an owner of itself.
+      if (rule.scope.value === calendarId) {
+        continue;
+      }
+      emails.add(rule.scope.value);
+    }
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+  return Array.from(emails);
 }
