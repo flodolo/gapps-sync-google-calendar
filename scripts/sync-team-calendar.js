@@ -24,7 +24,7 @@ limitations under the License.
 // calendars you do not administer, see publish-my-time-off.js.
 //
 // Configuration lives in config.js (copy config.dist.js to create it). In Apps
-// Script all files share one global scope, so TEAM_CALENDAR_IDS, MEMBER_ROLES,
+// Script all files share one global scope, so TEAM_CALENDARS, MEMBER_ROLES,
 // KEYWORDS, MONTHS_IN_ADVANCE, STRICT_MATCH, SANITIZE_EVENTS and
 // SANITIZED_TITLE are defined there, and the shared helpers live in common.js.
 
@@ -116,20 +116,22 @@ function performSync(options) {
   let skipped = 0;
   let failed = 0;
   const problems = [];
-  for (const calendarId of TEAM_CALENDAR_IDS) {
-    console.log("Team calendar: %s", calendarId);
+  for (const calendar of calendarEntries(TEAM_CALENDARS)) {
+    console.log("Team calendar: %s", calendarLabel(calendar));
     try {
       const result = syncTeamCalendar(
-        calendarId, today, maxDate, strict, options, properties, timeZone,
+        calendar, today, maxDate, strict, options, properties, timeZone,
       );
       count += result.count;
       skipped += result.skipped;
       failed += result.failed;
     } catch (error) {
-      problems.push(`team calendar ${calendarId} failed: ${String(error)}`);
+      problems.push(
+        `team calendar ${calendarLabel(calendar)} failed: ${String(error)}`,
+      );
       console.error(
         "Team calendar %s failed: %s; will retry next run",
-        calendarId, String(error),
+        calendarLabel(calendar), String(error),
       );
     }
   }
@@ -149,7 +151,8 @@ function performSync(options) {
 /**
  * Syncs one team calendar: reads its ACL for the member list, then imports each
  * member's qualifying events into it.
- * @param {string} calendarId The team calendar to import into.
+ * @param {{name: string, id: string}} calendar The team calendar to import
+ *     into. Checkpoints use its ID, so renaming it keeps them valid.
  * @param {Date} today Start of the window.
  * @param {Date} maxDate End of the window.
  * @param {boolean} strict Whether STRICT_MATCH filtering applies.
@@ -157,10 +160,14 @@ function performSync(options) {
  * @param {Properties} properties The script properties store.
  * @return {{count: number, skipped: number, failed: number}} Per-calendar tally.
  */
-function syncTeamCalendar(calendarId, today, maxDate, strict, options, properties, timeZone) {
+function syncTeamCalendar(calendar, today, maxDate, strict, options, properties, timeZone) {
+  const calendarId = calendar.id;
   // Gets the list of people with write access to the team calendar.
   const users = getCalendarEditors(calendarId);
-  console.log(`Found ${users.length} team members with write access`);
+  console.log(
+    "Found %s team members with write access to %s",
+    users.length, calendar.name,
+  );
 
   const prefix = `lastRun:${calendarId}:`;
   // One loader for this calendar, shared by all of its members.
@@ -195,8 +202,8 @@ function syncTeamCalendar(calendarId, today, maxDate, strict, options, propertie
       try {
         // Publishing can independently keep this person's copies on this
         // calendar, in which case they are not stale and must survive.
-        const publishingHere = typeof PUBLISH_CALENDAR_IDS !== "undefined" &&
-          PUBLISH_CALENDAR_IDS.includes(calendarId) &&
+        const publishingHere = typeof PUBLISH_CALENDARS !== "undefined" &&
+          calendarIds(PUBLISH_CALENDARS).includes(calendarId) &&
           properties.getProperty(`lastPublish:${calendarId}:${email}`);
         if (publishingHere) {
           // The key is the only thing that would ever trigger this cleanup, so
@@ -264,9 +271,9 @@ function inspectEvents() {
   const maxDate = new Date();
   maxDate.setDate(maxDate.getDate() + 30);
 
-  for (const calendarId of TEAM_CALENDAR_IDS) {
-    console.log("Team calendar: %s", calendarId);
-    for (const email of getCalendarEditors(calendarId)) {
+  for (const calendar of calendarEntries(TEAM_CALENDARS)) {
+    console.log("Team calendar: %s", calendarLabel(calendar));
+    for (const email of getCalendarEditors(calendar.id)) {
       const events = findEvents(email, today, maxDate, null);
       console.log("  %s: %s events", email, events.length);
       for (const event of events) {
@@ -285,7 +292,7 @@ function inspectEvents() {
 }
 
 /**
- * Diagnostic helper: checks whether every calendar in TEAM_CALENDAR_IDS is
+ * Diagnostic helper: checks whether every calendar in TEAM_CALENDARS is
  * reachable by the account running the script, and with which access role. Run
  * this manually when acl.list returns 'Not Found'.
  */
@@ -293,21 +300,21 @@ function diagnoseCalendarAccess() {
   console.log("Running as: %s", Session.getEffectiveUser().getEmail());
 
   let unreachable = false;
-  for (const calendarId of TEAM_CALENDAR_IDS) {
+  for (const calendar of calendarEntries(TEAM_CALENDARS)) {
     let entry;
     try {
-      entry = Calendar.CalendarList.get(calendarId);
+      entry = Calendar.CalendarList.get(calendar.id);
     } catch (e) {
       unreachable = true;
       console.error(
         "%s is not in this account's calendar list: %s",
-        calendarId, e.toString(),
+        calendarLabel(calendar), e.toString(),
       );
       continue;
     }
     console.log(
       "%s: found '%s' with accessRole '%s'",
-      calendarId, entry.summary, entry.accessRole,
+      calendarLabel(calendar), entry.summary, entry.accessRole,
     );
     if (entry.accessRole !== "owner") {
       console.warn(
@@ -336,12 +343,12 @@ function diagnoseCalendarAccess() {
  * calendars and which entries the sync will skip.
  */
 function listCalendarAccess() {
-  for (const calendarId of TEAM_CALENDAR_IDS) {
-    console.log("Team calendar: %s", calendarId);
+  for (const calendar of calendarEntries(TEAM_CALENDARS)) {
+    console.log("Team calendar: %s", calendarLabel(calendar));
     const byRole = {};
     let pageToken = null;
     do {
-      const response = Calendar.Acl.list(calendarId, {
+      const response = Calendar.Acl.list(calendar.id, {
         pageToken: pageToken,
       });
       for (const rule of response.items) {

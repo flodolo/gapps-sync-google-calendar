@@ -42,7 +42,7 @@ project; everything else is local tooling.
 
 ### Pulling the team's time off (`sync-team-calendar.js`)
 
-Each calendar listed in `TEAM_CALENDAR_IDS` is synced independently, and the
+Each calendar listed in `TEAM_CALENDARS` is synced independently, and the
 steps below run once per calendar.
 
 1. The script reads the ACL of the team calendar and collects every individual
@@ -66,7 +66,7 @@ steps below run once per calendar.
 
 ### Publishing your own time off (`publish-my-time-off.js`)
 
-Each calendar listed in `PUBLISH_CALENDAR_IDS` receives your time off, and the
+Each calendar listed in `PUBLISH_CALENDARS` receives your time off, and the
 steps below run once per calendar.
 
 1. The source is always the account running the script — whoever authorised it,
@@ -89,8 +89,8 @@ neither skips work the other has done.
 
 Some details worth knowing:
 
-- **Multiple team calendars.** `TEAM_CALENDAR_IDS` can hold any number of
-  calendars. Each has its own ACL, so each has its own membership; someone who
+- **Multiple team calendars.** `TEAM_CALENDARS` can hold any number of
+  calendars, each with a display name used in the execution log. Each has its own ACL, so each has its own membership; someone who
   is an editor on two of them has their time off copied to both. Checkpoints
   are keyed per calendar and per person, and a calendar that cannot be read is
   logged and reported at the end without blocking the others.
@@ -118,7 +118,7 @@ Some details worth knowing:
   departed-member cleanup.
 - **Departed members.** When someone no longer has write access, their future
   copies are removed and their checkpoint is dropped — but only after the
-  removal succeeds, and never while `PUBLISH_CALENDAR_IDS` shows they are still
+  removal succeeds, and never while `PUBLISH_CALENDARS` shows they are still
   publishing to that same calendar, in which case the checkpoint is kept so the
   copies stay reclaimable. If the ACL returns *no* individual users at all, no
   cleanup happens: switching a calendar's sharing to a group, or narrowing
@@ -169,7 +169,7 @@ These are the functions to run from the Apps Script editor's function picker.
 | `fullSync` | Re-scans the whole window, ignoring checkpoints. Catches events created outside the window that have since slid into it without being modified. |
 | `testSync` | **Dry run** over the next 7 days: logs what would be imported and removed, writes nothing, and does not move any checkpoint. Run this first after configuring. |
 | `inspectEvents` | Diagnostic: dumps the raw start/end of every out-of-office event in the next 30 days, with the verdict of the all-day and strict-match checks. |
-| `diagnoseCalendarAccess` | Diagnostic: checks that every calendar in `TEAM_CALENDAR_IDS` is reachable by the account running the script and reports its access role. Use when ACL reads fail with "Not Found". |
+| `diagnoseCalendarAccess` | Diagnostic: checks that every calendar in `TEAM_CALENDARS` is reachable by the account running the script and reports its access role. Use when ACL reads fail with "Not Found". |
 | `listCalendarAccess` | Diagnostic: lists every ACL entry of each team calendar grouped by role, so you can see who will be synced and which entries are skipped. |
 
 Both scripts use the same schedule: the incremental run happens daily between
@@ -195,14 +195,29 @@ there.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `TEAM_CALENDAR_IDS` | — | List of the shared calendars events are copied to. Find each ID in the calendar's settings under *Integrate calendar* → *Calendar ID*. |
-| `PUBLISH_CALENDAR_IDS` | `[]` | List of calendars `publish-my-time-off.js` copies *your own* time off to. Empty disables that script. Only write access is needed, unlike `TEAM_CALENDAR_IDS`. |
+| `TEAM_CALENDARS` | `{}` | The shared calendars events are copied to, as display name → calendar ID. Find each ID in the calendar's settings under *Integrate calendar* → *Calendar ID*. Empty disables the team sync. |
+| `PUBLISH_CALENDARS` | `{}` | The calendars `publish-my-time-off.js` copies *your own* time off to, in the same form. Empty disables that script. Only write access is needed, unlike `TEAM_CALENDARS`. |
 | `MEMBER_ROLES` | `["writer", "owner"]` | ACL roles that identify a team member whose calendar should be scanned. `writer` is "Make changes to events", `owner` is "Make changes and manage sharing". |
 | `KEYWORDS` | `["vacation", "ooo", "pto", "wellness", "holiday", "on leave"]` | Lowercase title fragments that mark a *timed* event as time off. Only used when `STRICT_MATCH` is true. |
 | `MONTHS_IN_ADVANCE` | `3` | How far ahead to look for events. |
 | `STRICT_MATCH` | `true` | When true, timed events need a keyword in the title; all-day events always qualify. When false, every out-of-office event in the window is imported. |
 | `SANITIZE_EVENTS` | `true` | When true, the original title, description and location are dropped and the copy is titled `[username] <SANITIZED_TITLE>`, keeping private details off the shared calendar. When false, the original title is kept, prefixed with `[username]`. |
 | `SANITIZED_TITLE` | `"Away"` | Title used for imported events when `SANITIZE_EVENTS` is true. |
+
+Both calendar settings are objects mapping a display name to a calendar ID:
+
+```js
+const TEAM_CALENDARS = {
+  "Localization": "abc123@group.calendar.google.com",
+  "Add-ons": "def456@group.calendar.google.com",
+};
+```
+
+The names exist only to make the execution log readable — runs report
+`Team calendar: Localization (abc123@group.calendar.google.com)` rather than a
+bare ID. Checkpoints are keyed by calendar ID, so renaming a calendar here does
+not restart it or orphan its state. A setting written as a plain array of IDs is
+still accepted, so a `config.js` predating the names keeps working.
 
 In Apps Script all files share a single global scope, so the constants defined
 in `scripts/config.js` are visible to `scripts/sync-team-calendar.js` with no
@@ -224,8 +239,8 @@ instead.
    [script.google.com](https://script.google.com), or push this directory with
    [`clasp`](https://github.com/google/clasp).
 4. **Configure.** `cp scripts/config.dist.js scripts/config.js`, then set
-   `TEAM_CALENDAR_IDS` and/or `PUBLISH_CALENDAR_IDS` — whichever directions you
-   want — and review the other settings. Either list can stay empty.
+   `TEAM_CALENDARS` and/or `PUBLISH_CALENDARS` — whichever directions you
+   want — and review the other settings. Either one can stay empty.
 5. **Add the files to the project.** Everything in `scripts/`: `config.js`,
    `common.js`, and whichever of `sync-team-calendar.js` and
    `publish-my-time-off.js` you are using. Tests live in `tests/`, outside that

@@ -1,6 +1,6 @@
 // Pushes your own time off to shared calendars: the events come from the
 // calendar of whoever runs the script, and go to every calendar listed in
-// PUBLISH_CALENDAR_IDS. Unlike sync-team-calendar.js this needs no
+// PUBLISH_CALENDARS. Unlike sync-team-calendar.js this needs no
 // administrative access to the destinations, only permission to make changes
 // to events, so it suits calendars you contribute to but do not own.
 //
@@ -53,7 +53,7 @@ function setupPublish() {
 
 /**
  * Copies your qualifying out-of-office events to every calendar in
- * PUBLISH_CALENDAR_IDS, looking only at events modified since the last run.
+ * PUBLISH_CALENDARS, looking only at events modified since the last run.
  */
 function publishMyTimeOff() {
   // Note: no parameters. Time-based triggers pass an event object as the first
@@ -101,8 +101,9 @@ function runPublish(options = {}) {
 }
 
 function performPublish(options) {
-  if (!PUBLISH_CALENDAR_IDS.length) {
-    console.log("PUBLISH_CALENDAR_IDS is empty; nothing to publish.");
+  const destinations = calendarEntries(PUBLISH_CALENDARS);
+  if (!destinations.length) {
+    console.log("PUBLISH_CALENDARS is empty; nothing to publish.");
     return;
   }
 
@@ -113,12 +114,15 @@ function performPublish(options) {
   console.log("Publishing the time off of %s", email);
 
   // Each destination advances independently, under a key of its own so that a
-  // calendar listed in both PUBLISH_CALENDAR_IDS and TEAM_CALENDAR_IDS does not
-  // share a checkpoint with the team sync.
+  // calendar listed in both PUBLISH_CALENDARS and TEAM_CALENDARS does not
+  // share a checkpoint with the team sync. The key uses the calendar ID, so
+  // renaming a destination does not restart it.
   let count = 0;
   let skipped = 0;
   let failed = 0;
-  for (const calendarId of PUBLISH_CALENDAR_IDS) {
+  for (const calendar of destinations) {
+    const calendarId = calendar.id;
+    console.log("Destination: %s", calendarLabel(calendar));
     const checkpoint = `lastPublish:${calendarId}:${email}`;
     try {
       const lastRun = options.ignoreLastRun
@@ -148,7 +152,7 @@ function performPublish(options) {
       failed++;
       console.error(
         "Publishing to %s failed: %s; will retry next run",
-        calendarId, String(error),
+        calendarLabel(calendar), String(error),
       );
     }
   }
@@ -163,31 +167,32 @@ function performPublish(options) {
 }
 
 /**
- * Diagnostic helper: checks that every calendar in PUBLISH_CALENDAR_IDS is
+ * Diagnostic helper: checks that every calendar in PUBLISH_CALENDARS is
  * reachable by the account running the script and writable by it. Run this
  * manually when publishing fails.
  */
 function diagnosePublishAccess() {
   console.log("Running as: %s", Session.getEffectiveUser().getEmail());
-  if (!PUBLISH_CALENDAR_IDS.length) {
-    console.warn("PUBLISH_CALENDAR_IDS is empty.");
+  const destinations = calendarEntries(PUBLISH_CALENDARS);
+  if (!destinations.length) {
+    console.warn("PUBLISH_CALENDARS is empty.");
     return;
   }
-  for (const calendarId of PUBLISH_CALENDAR_IDS) {
+  for (const calendar of destinations) {
     let entry;
     try {
-      entry = Calendar.CalendarList.get(calendarId);
+      entry = Calendar.CalendarList.get(calendar.id);
     } catch (e) {
       console.error(
         "%s is not in this account's calendar list: %s",
-        calendarId, e.toString(),
+        calendarLabel(calendar), e.toString(),
       );
       continue;
     }
     const writable = entry.accessRole === "writer" || entry.accessRole === "owner";
     console.log(
       "%s: '%s' with accessRole '%s'%s",
-      calendarId, entry.summary, entry.accessRole,
+      calendarLabel(calendar), entry.summary, entry.accessRole,
       writable ? "" : " — NOT writable, publishing will fail",
     );
   }

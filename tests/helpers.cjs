@@ -20,7 +20,7 @@ function load(files) {
  *     lexical declarations, so they are not properties of the context object
  *     and have to be read from inside it.
  */
-function context(files, configKeys = ['TEAM_CALENDAR_IDS']) {
+function context(files, configKeys = ['TEAM_CALENDARS']) {
   const state = {writes:0, removed:[], imports:[], released:0, properties:{}, logs:[], triggers:[], triggerSpecs:[], deletedTriggers:[]};
   const c = {
     Date: class extends Date {
@@ -71,7 +71,15 @@ function context(files, configKeys = ['TEAM_CALENDAR_IDS']) {
   vm.runInContext(load(files), c);
   c.getCalendarEditors=()=>['alice@example.com'];
   const config = vm.runInContext(`({${configKeys.join(',')}})`, c);
-  return {c, state, config, run:(code)=>vm.runInContext(code, c)};
+  const run = (code)=>vm.runInContext(code, c);
+  // The settings are name-to-ID objects declared with const: the object is
+  // mutated to add a calendar rather than reassigned.
+  const addCalendar = (setting, name, id)=>{
+    run(`${setting}[${JSON.stringify(name)}] = ${JSON.stringify(id)}`);
+    return id;
+  };
+  return {c, state, config, run, addCalendar,
+    ids:(setting)=>Object.values(config[setting])};
 }
 
 /** A timed event, the shape returned by the Calendar API for OOO events. */

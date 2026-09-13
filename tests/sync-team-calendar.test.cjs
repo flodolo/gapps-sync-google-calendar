@@ -3,6 +3,8 @@ const {context: makeContext, timed, runner} = require('./helpers.cjs');
 
 const {test, done} = runner();
 const context = () => makeContext(['sync-team-calendar.js']);
+// TEAM_CALENDARS maps display name to calendar ID; tests care about the IDs.
+const teamCalendar = (config, index = 0) => Object.values(config.TEAM_CALENDARS)[index];
 test('partial final day remains timed and fails strict matching',()=>{
  const {c}=context(),e=timed('2026-09-12T00:00:00Z','2026-09-13T12:00:00Z');
  assert.equal(c.isAllDayEvent(e),false);assert.equal(c.isStrictMatch(e),false);
@@ -46,14 +48,14 @@ test('fetch, import, and delete failures preserve timestamp and release lock',()
 test('empty pages do not produce undefined events',()=>{const {c}=context();assert.equal(c.findEvents('alice',new Date(),new Date(),null).length,0);});
 test('import tags copy and does not mutate original',()=>{
  const {c,state,config}=context(),e={id:'source',summary:'PTO',eventType:'outOfOffice',start:{date:'2026-09-12'},end:{date:'2026-09-13'}};
- c.importEvent(config.TEAM_CALENDAR_IDS[0],'alice',e,'alice@example.com');assert.equal(e.summary,'PTO');assert.equal(state.imports[0].summary,'[alice] Away');assert.equal(state.imports[0].transparency,'transparent');assert.equal(state.imports[0].extendedProperties.private.awaySource,'alice@example.com/source');
+ c.importEvent(teamCalendar(config),'alice',e,'alice@example.com');assert.equal(e.summary,'PTO');assert.equal(state.imports[0].summary,'[alice] Away');assert.equal(state.imports[0].transparency,'transparent');assert.equal(state.imports[0].extendedProperties.private.awaySource,'alice@example.com/source');
 });
 test('imported copies carry no reminders, whatever the source had',()=>{
  const {c,state,config}=context();
  for (const reminders of [undefined,{useDefault:true},{useDefault:false,overrides:[{method:'popup',minutes:30}]}]) {
   const e={id:'source',summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}};
   if(reminders)e.reminders=reminders;
-  c.importEvent(config.TEAM_CALENDAR_IDS[0],'alice',e,'alice@example.com');
+  c.importEvent(teamCalendar(config),'alice',e,'alice@example.com');
  }
  for (const copy of state.imports) {
   assert.equal(copy.reminders.useDefault,false);
@@ -63,12 +65,12 @@ test('imported copies carry no reminders, whatever the source had',()=>{
 });
 test('inaccessible calendar does not block later users, and recovery retries',()=>{
  const {c,state,config}=context();const calls=[];let broken=true;
- const aliceKey=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:alice@example.com`;
- const bobKey=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:bob@example.com`;
+ const aliceKey=`lastRun:${teamCalendar(config)}:alice@example.com`;
+ const bobKey=`lastRun:${teamCalendar(config)}:bob@example.com`;
  state.properties[aliceKey]='2026-09-01T00:00:00.000Z';
  c.getCalendarEditors=()=>['alice@example.com','bob@example.com'];
  c.Calendar.Events.list=(email,params)=>{
-  if(email===config.TEAM_CALENDAR_IDS[0]) return {items:[]};
+  if(email===teamCalendar(config)) return {items:[]};
   calls.push({email,since:params.updatedMin});
   if(email==='alice@example.com' && broken) throw Error('Not Found');
   return {items:[]};
@@ -106,11 +108,11 @@ test('many exclusions across users share one paginated lookup and log reasons',(
 });
 test('incremental runs without exclusions never load destination calendar',()=>{
  const {c,state,config}=context();
- state.properties[`lastRun:${config.TEAM_CALENDAR_IDS[0]}:alice@example.com`]='2026-08-31T08:00:00Z';
+ state.properties[`lastRun:${teamCalendar(config)}:alice@example.com`]='2026-08-31T08:00:00Z';
  c.findEvents=()=>[];c.Calendar.Events.list=()=>assert.fail('Unexpected destination lookup');c.runSync();
 });
 test('cleanup removes only legacy and departed-user state for this team',()=>{
- const {c,state,config}=context();const prefix=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:`;
+ const {c,state,config}=context();const prefix=`lastRun:${teamCalendar(config)}:`;
  Object.assign(state.properties,{lastRun:'old',[prefix+'departed@example.com']:'old',[prefix+'alice@example.com']:'2026-09-01T00:00:00Z','lastRun:other-team:user':'keep',setting:'keep'});
  c.runSync();assert.equal(state.properties.lastRun,undefined);assert.equal(state.properties[prefix+'departed@example.com'],undefined);
  assert.ok(state.properties[prefix+'alice@example.com']);assert.equal(state.properties['lastRun:other-team:user'],'keep');assert.equal(state.properties.setting,'keep');
@@ -129,9 +131,9 @@ test('tagged copies for another source are not removed by legacy fallback',()=>{
  c.runSync();assert.equal(state.removed.length,0);
 });
 test('each team calendar syncs independently with its own members and checkpoints',()=>{
- const {c,state,config,run}=context();
- run('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")');
- const [first,second]=config.TEAM_CALENDAR_IDS;
+ const {c,state,config,addCalendar}=context();
+ addCalendar('TEAM_CALENDARS','Second team','second@group.calendar.google.com');
+ const [first,second]=Object.values(config.TEAM_CALENDARS);
  c.getCalendarEditors=(calendarId)=>calendarId===first?['alice@example.com']:['bob@example.com'];
  c.findEvents=(email)=>[{id:`src-${email}`,summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}}];
  c.runSync();
@@ -142,9 +144,9 @@ test('each team calendar syncs independently with its own members and checkpoint
  assert.equal(state.properties[`lastRun:${first}:bob@example.com`],undefined);
 });
 test('one unreachable team calendar does not stop the others',()=>{
- const {c,state,config,run}=context();
- run('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")');
- const [first,second]=config.TEAM_CALENDAR_IDS;
+ const {c,state,config,addCalendar}=context();
+ addCalendar('TEAM_CALENDARS','Second team','second@group.calendar.google.com');
+ const [first,second]=Object.values(config.TEAM_CALENDARS);
  c.getCalendarEditors=(calendarId)=>{if(calendarId===first)throw Error('ACL unavailable');return ['bob@example.com'];};
  c.findEvents=()=>[];
  assert.throws(()=>c.runSync(),/ACL unavailable/);
@@ -152,9 +154,9 @@ test('one unreachable team calendar does not stop the others',()=>{
  assert.equal(state.released,1);
 });
 test('a failing member on one calendar leaves the other calendar advancing',()=>{
- const {c,state,config,run}=context();
- run('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")');
- const [first,second]=config.TEAM_CALENDAR_IDS;
+ const {c,state,config,addCalendar}=context();
+ addCalendar('TEAM_CALENDARS','Second team','second@group.calendar.google.com');
+ const [first,second]=Object.values(config.TEAM_CALENDARS);
  c.getCalendarEditors=()=>['alice@example.com'];
  let calls=0;
  c.findEvents=()=>{if(++calls===1)throw Error('503');return [];};
@@ -189,5 +191,30 @@ test('setup schedules a daily sync at 08:00 and a full sync on Monday at 07:00',
   {handler:'sync',schedule:['everyDays:1','atHour:8']},
   {handler:'fullSync',schedule:['onWeekDay:MONDAY','atHour:7']},
  ]);
+});
+test('the configured name is used in the log and in failure messages',()=>{
+ const {c,state,config,addCalendar}=context();
+ addCalendar('TEAM_CALENDARS','Localization','l10n@group.calendar.google.com');
+ c.getCalendarEditors=(calendarId)=>{
+  if(calendarId==='l10n@group.calendar.google.com') throw Error('ACL unavailable');
+  return ['alice@example.com'];
+ };
+ c.findEvents=()=>[];
+ assert.throws(()=>c.runSync(),/Localization \(l10n@group.calendar.google.com\)/);
+ const name=Object.keys(config.TEAM_CALENDARS)[0];
+ assert.ok(state.logs.some((line)=>line===`Team calendar: ${name} (${teamCalendar(config)})`));
+ assert.ok(state.logs.some((line)=>line===`Found 1 team members with write access to ${name}`));
+});
+test('a calendar setting written as a plain list of IDs still works',()=>{
+ const {c}=context();
+ // A config.js predating the names needs no edit to keep running.
+ // Compared as JSON: objects built inside the vm have another realm's prototype.
+ assert.equal(JSON.stringify(c.calendarEntries(['a@example.com'])),
+  JSON.stringify([{name:'a@example.com',id:'a@example.com'}]));
+ assert.equal(c.calendarIds(['a@example.com','b@example.com']).join(),'a@example.com,b@example.com');
+ assert.equal(c.calendarEntries(undefined).length,0);
+ // The ID is not repeated when it is standing in as the name.
+ assert.equal(c.calendarLabel({name:'a@example.com',id:'a@example.com'}),'a@example.com');
+ assert.equal(c.calendarLabel({name:'Team',id:'a@example.com'}),'Team (a@example.com)');
 });
 done();

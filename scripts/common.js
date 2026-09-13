@@ -24,6 +24,36 @@ limitations under the License.
 
 
 /**
+ * Normalizes a calendar setting into entries to iterate over.
+ *
+ * The settings are written as name-to-ID objects so the log can name each
+ * calendar. An array of bare IDs is still accepted, so a config.js written
+ * before names existed keeps working, with the ID standing in as the name.
+ * @param {Object|string[]} setting TEAM_CALENDARS or PUBLISH_CALENDARS.
+ * @return {{name: string, id: string}[]} One entry per configured calendar.
+ */
+function calendarEntries(setting) {
+  if (!setting) return [];
+  if (Array.isArray(setting)) return setting.map((id) => ({ name: id, id }));
+  return Object.keys(setting).map((name) => ({ name, id: setting[name] }));
+}
+
+/** The IDs of a calendar setting, ignoring the names. */
+function calendarIds(setting) {
+  return calendarEntries(setting).map((entry) => entry.id);
+}
+
+/**
+ * How a calendar is named in the log: the configured name, with the ID kept
+ * alongside it when they differ, so the log stays greppable by either.
+ */
+function calendarLabel(calendar) {
+  return calendar.name === calendar.id
+    ? calendar.id
+    : `${calendar.name} (${calendar.id})`;
+}
+
+/**
  * Removes any existing triggers for the given handler functions, so a setup
  * function can be re-run to apply a new schedule. Only the handlers named here
  * are touched, which is what lets the two scripts be scheduled in the same

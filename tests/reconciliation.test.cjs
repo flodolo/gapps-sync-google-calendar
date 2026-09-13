@@ -13,10 +13,10 @@ const away = (id = 'source') => ({
 
 function fixture(mode) {
   const ctx = context(['sync-team-calendar.js', 'publish-my-time-off.js'],
-    ['TEAM_CALENDAR_IDS', 'PUBLISH_CALENDAR_IDS']);
+    ['TEAM_CALENDARS', 'PUBLISH_CALENDARS']);
   const {c, state, config} = ctx;
-  const calendar = config.TEAM_CALENDAR_IDS[0];
-  config.PUBLISH_CALENDAR_IDS.push(calendar);
+  const calendar = Object.values(config.TEAM_CALENDARS)[0];
+  ctx.addCalendar('PUBLISH_CALENDARS', 'Shared', calendar);
   const email = mode === 'team' ? 'alice@example.com' : 'me@example.com';
   const key = `${mode === 'team' ? 'lastRun' : 'lastPublish'}:${calendar}:${email}`;
   const copies = new Map();

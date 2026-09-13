@@ -2,13 +2,13 @@ const assert = require('node:assert/strict');
 const {context: makeContext, timed, runner} = require('./helpers.cjs');
 
 const {test, done} = runner();
-// PUBLISH_CALENDAR_IDS is empty in the reference config, so each test pushes
-// the destinations it needs. The array is a lexical const, so it is mutated
-// from inside the context rather than reassigned.
-const context = () => makeContext(['publish-my-time-off.js'], ['PUBLISH_CALENDAR_IDS','TEAM_CALENDAR_IDS']);
+// PUBLISH_CALENDARS is empty in the reference config, so each test adds the
+// destinations it needs. It is a name-to-ID object declared with const, so it
+// is mutated from inside the context rather than reassigned.
+const context = () => makeContext(['publish-my-time-off.js'], ['PUBLISH_CALENDARS','TEAM_CALENDARS']);
 const withDestinations = (...ids) => {
   const ctx = context();
-  ctx.run(`PUBLISH_CALENDAR_IDS.push(${ids.map((id)=>JSON.stringify(id)).join(',')})`);
+  ids.forEach((id,index)=>ctx.addCalendar('PUBLISH_CALENDARS',`Shared ${index+1}`,id));
   return ctx;
 };
 const allDay = (id='mine') => ({id,summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}});

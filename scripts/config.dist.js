@@ -6,27 +6,35 @@
 // In Apps Script every file shares one global scope, so these constants are
 // visible to sync-team-calendar.js without any import.
 
-// IDs of the team calendars events are copied to. Find each one in the
-// calendar's settings page, under "Integrate calendar" > "Calendar ID".
+// The team calendars events are copied to, as a mapping of display name to
+// calendar ID. The names are only used to make the execution log readable;
+// find each ID in the calendar's settings page, under "Integrate calendar" >
+// "Calendar ID".
 //
 // Each calendar is synced independently: its own ACL decides whose personal
 // calendar is scanned for it, and it keeps its own per-user checkpoints. A
 // person who is an editor on two of these calendars has their time off copied
 // to both. One unreachable calendar is reported but does not stop the others.
-const TEAM_CALENDAR_IDS = [
-  "your-calendar-id@group.calendar.google.com",
-];
-
-// Calendars that your own out-of-office events are published to by
-// publish-my-time-off.js. Leave empty to disable that script.
 //
-// This is the reverse direction of TEAM_CALENDAR_IDS: instead of pulling the
+// Checkpoints are keyed by calendar ID, not by name, so renaming a calendar
+// here costs nothing. Leave empty to disable the team sync.
+const TEAM_CALENDARS = {
+  "Team name": "your-calendar-id@group.calendar.google.com",
+};
+
+// The calendars your own out-of-office events are published to by
+// publish-my-time-off.js, in the same name-to-ID form. Leave empty to disable
+// that script.
+//
+// This is the reverse direction of TEAM_CALENDARS: instead of pulling the
 // whole team's time off into a calendar you administer, it pushes only your own
 // time off to calendars you merely have write access to. The two are
 // independent, and listing the same calendar in both is harmless: copies are
 // matched by source event, so the two scripts converge on one copy rather than
 // creating two.
-const PUBLISH_CALENDAR_IDS = [];
+const PUBLISH_CALENDARS = {
+  // "Another team": "their-calendar-id@group.calendar.google.com",
+};
 
 // Calendar ACL roles that identify a team member: their personal calendar is
 // scanned for out-of-office events. 'writer' is "Make changes to events",
