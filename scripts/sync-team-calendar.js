@@ -29,21 +29,23 @@ limitations under the License.
 // SANITIZED_TITLE are defined there, and the shared helpers live in common.js.
 
 /**
- * Sets up the script to run automatically: an hourly incremental sync, plus a
- * nightly full sync that re-scans the whole window.
+ * Sets up the script to run automatically, and can be re-run at any time to
+ * apply a new schedule: its own triggers are replaced, while any trigger
+ * belonging to publish-my-time-off.js is left alone.
+ *
+ * The schedule is a daily incremental sync between
+ * 08:00 and 09:00, plus a weekly full sync on Monday between 07:00 and 08:00
+ * that re-scans the whole window. Apps Script picks a moment inside the hour
+ * it is given, so these are windows rather than exact times.
  */
 function setup() {
-  // Only this script's own triggers are considered, so it can coexist with
-  // publish-my-time-off.js in the same project.
-  const handlers = ["sync", "fullSync"];
-  const existing = ScriptApp.getProjectTriggers().filter((trigger) =>
-    handlers.includes(trigger.getHandlerFunction()),
-  );
-  if (existing.length > 0) {
-    throw new Error("Triggers are already setup.");
-  }
-  ScriptApp.newTrigger("sync").timeBased().everyHours(1).create();
-  ScriptApp.newTrigger("fullSync").timeBased().everyDays(1).atHour(3).create();
+  clearTriggers(["sync", "fullSync"]);
+  ScriptApp.newTrigger("sync").timeBased().everyDays(1).atHour(8).create();
+  ScriptApp.newTrigger("fullSync")
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(7)
+    .create();
   // Runs the first sync immediately.
   fullSync();
 }

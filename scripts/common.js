@@ -24,6 +24,26 @@ limitations under the License.
 
 
 /**
+ * Removes any existing triggers for the given handler functions, so a setup
+ * function can be re-run to apply a new schedule. Only the handlers named here
+ * are touched, which is what lets the two scripts be scheduled in the same
+ * project without disturbing each other.
+ * @param {string[]} handlers Names of the handler functions to clear.
+ * @return {number} How many triggers were removed.
+ */
+function clearTriggers(handlers) {
+  let removed = 0;
+  for (const trigger of ScriptApp.getProjectTriggers()) {
+    if (handlers.includes(trigger.getHandlerFunction())) {
+      ScriptApp.deleteTrigger(trigger);
+      console.log("Removed existing trigger for %s", trigger.getHandlerFunction());
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
  * Computes the window to scan, and logs it.
  * @param {Object} options The runSync()/runPublish() options.
  * @return {{today: Date, maxDate: Date}} Start and end of the window.

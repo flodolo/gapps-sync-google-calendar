@@ -21,16 +21,31 @@ function load(files) {
  *     and have to be read from inside it.
  */
 function context(files, configKeys = ['TEAM_CALENDAR_IDS']) {
-  const state = {writes:0, removed:[], imports:[], released:0, properties:{}, logs:[], triggers:[]};
+  const state = {writes:0, removed:[], imports:[], released:0, properties:{}, logs:[], triggers:[], triggerSpecs:[], deletedTriggers:[]};
   const c = {
     console:{log(...args){state.logs.push(util.format(...args));}, error(){}, warn(){}},
     LockService:{getScriptLock:()=>({waitLock(){}, releaseLock(){state.released++;}})},
     PropertiesService:{getScriptProperties:()=>({getProperties:()=>({...state.properties}),deleteProperty(key){delete state.properties[key];},getProperty:(key)=>state.properties[key] || null,setProperty(key,value){state.writes++;state.properties[key]=value;}})},
     Session:{getEffectiveUser:()=>({getEmail:()=>'me@example.com'})},
     ScriptApp:{
+      WeekDay:{MONDAY:'MONDAY',TUESDAY:'TUESDAY',WEDNESDAY:'WEDNESDAY',THURSDAY:'THURSDAY',FRIDAY:'FRIDAY',SATURDAY:'SATURDAY',SUNDAY:'SUNDAY'},
       getProjectTriggers:()=>state.triggers.map((h)=>({getHandlerFunction:()=>h})),
+      deleteTrigger(trigger){
+        const handler=trigger.getHandlerFunction();
+        state.deletedTriggers.push(handler);
+        state.triggers.splice(state.triggers.indexOf(handler),1);
+      },
       newTrigger(handler){
-        const builder={timeBased:()=>builder,everyHours:()=>builder,everyDays:()=>builder,atHour:()=>builder,create(){state.triggers.push(handler);}};
+        // Records the schedule as a readable string so tests can assert it.
+        const spec={handler,schedule:[]};
+        const builder={
+          timeBased:()=>builder,
+          everyHours(n){spec.schedule.push(`everyHours:${n}`);return builder;},
+          everyDays(n){spec.schedule.push(`everyDays:${n}`);return builder;},
+          onWeekDay(day){spec.schedule.push(`onWeekDay:${day}`);return builder;},
+          atHour(hour){spec.schedule.push(`atHour:${hour}`);return builder;},
+          create(){state.triggers.push(handler);state.triggerSpecs.push(spec);},
+        };
         return builder;
       },
     },

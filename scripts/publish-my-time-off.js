@@ -28,20 +28,25 @@ limitations under the License.
 
 
 /**
- * Sets up this script to run automatically: an hourly incremental publish plus
- * a nightly full publish that re-scans the whole window. Only this script's own
- * triggers are considered, so it can coexist with sync-team-calendar.js.
+ * Sets up this script to run automatically, and can be re-run at any time to
+ * apply a new schedule: its own triggers are replaced, while any trigger
+ * belonging to sync-team-calendar.js is left alone.
+ *
+ * The schedule is a daily incremental publish
+ * between 08:00 and 09:00, plus a weekly full publish on Monday between 07:00
+ * and 08:00 that re-scans the whole window. Apps Script picks a moment inside
+ * the hour it is given, so these are windows rather than exact times. Only this
+ * script's own triggers are considered, so it can coexist with
+ * sync-team-calendar.js.
  */
 function setupPublish() {
-  const handlers = ["publishMyTimeOff", "fullPublishMyTimeOff"];
-  const existing = ScriptApp.getProjectTriggers().filter((trigger) =>
-    handlers.includes(trigger.getHandlerFunction()),
-  );
-  if (existing.length > 0) {
-    throw new Error("Publish triggers are already setup.");
-  }
-  ScriptApp.newTrigger("publishMyTimeOff").timeBased().everyHours(1).create();
-  ScriptApp.newTrigger("fullPublishMyTimeOff").timeBased().everyDays(1).atHour(4).create();
+  clearTriggers(["publishMyTimeOff", "fullPublishMyTimeOff"]);
+  ScriptApp.newTrigger("publishMyTimeOff").timeBased().everyDays(1).atHour(8).create();
+  ScriptApp.newTrigger("fullPublishMyTimeOff")
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(7)
+    .create();
   // Runs the first publish immediately.
   fullPublishMyTimeOff();
 }

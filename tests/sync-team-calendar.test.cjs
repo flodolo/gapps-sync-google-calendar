@@ -165,6 +165,26 @@ test('setup registers its own triggers and tolerates the publish ones',()=>{
  state.triggers.push('publishMyTimeOff');   // publish-my-time-off.js is scheduled
  c.setup();
  assert.deepEqual(state.triggers,['publishMyTimeOff','sync','fullSync']);
- assert.throws(()=>c.setup(),/already setup/);
+ assert.deepEqual(state.deletedTriggers,[]);
+});
+test('re-running setup replaces its own triggers and keeps the publish ones',()=>{
+ const {c,state}=context();
+ c.findEvents=()=>[];
+ state.triggers.push('publishMyTimeOff','fullPublishMyTimeOff');
+ c.setup();
+ // A second run must apply the new schedule rather than refusing.
+ c.setup();
+ assert.deepEqual(state.deletedTriggers,['sync','fullSync']);
+ assert.deepEqual(state.triggers,['publishMyTimeOff','fullPublishMyTimeOff','sync','fullSync']);
+ assert.equal(state.triggerSpecs.filter((t)=>t.handler==='sync').length,2);
+});
+test('setup schedules a daily sync at 08:00 and a full sync on Monday at 07:00',()=>{
+ const {c,state}=context();
+ c.findEvents=()=>[];
+ c.setup();
+ assert.deepEqual(state.triggerSpecs,[
+  {handler:'sync',schedule:['everyDays:1','atHour:8']},
+  {handler:'fullSync',schedule:['onWeekDay:MONDAY','atHour:7']},
+ ]);
 });
 done();

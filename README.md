@@ -108,8 +108,9 @@ Some details worth knowing:
   with a `dateTime`, not a `date`, so importing them verbatim would produce
   timed 00:00–23:59 blocks. The script detects whole-day ranges (including
   across DST transitions) and rewrites them as real all-day events.
-- **Locking.** Runs take a script lock, so an hourly trigger firing while a
-  full sync is still running will wait rather than double-import.
+- **Locking.** Runs take a script lock, so a trigger firing while another run
+  is still going will wait rather than double-import. The lock is shared by
+  both scripts, and the wait gives up after 30 seconds.
 
 ### Matching rules
 
@@ -131,19 +132,24 @@ These are the functions to run from the Apps Script editor's function picker.
 
 | Function | What it does |
 | --- | --- |
-| `setup` | Creates the triggers (hourly `sync`, nightly `fullSync` at 03:00) and performs a first full sync. Fails if triggers already exist. |
-| `sync` | Incremental sync: only events modified since each calendar's last run. This is what the hourly trigger calls. |
+| `setup` | Creates the triggers (daily `sync` between 08:00 and 09:00, weekly `fullSync` on Monday between 07:00 and 08:00) and performs a first full sync. Safe to re-run: it replaces its own triggers and leaves the publish script's alone. |
+| `sync` | Incremental sync: only events modified since each calendar's last run. This is what the daily trigger calls. |
 | `fullSync` | Re-scans the whole window, ignoring checkpoints. Catches events created outside the window that have since slid into it without being modified. |
 | `testSync` | **Dry run** over the next 7 days: logs what would be imported and removed, writes nothing, and does not move any checkpoint. Run this first after configuring. |
 | `inspectEvents` | Diagnostic: dumps the raw start/end of every out-of-office event in the next 30 days, with the verdict of the all-day and strict-match checks. |
 | `diagnoseCalendarAccess` | Diagnostic: checks that every calendar in `TEAM_CALENDAR_IDS` is reachable by the account running the script and reports its access role. Use when ACL reads fail with "Not Found". |
 | `listCalendarAccess` | Diagnostic: lists every ACL entry of each team calendar grouped by role, so you can see who will be synced and which entries are skipped. |
 
+Both scripts use the same schedule: the incremental run happens daily between
+08:00 and 09:00, and the full re-scan weekly on Monday between 07:00 and 08:00.
+Apps Script only lets you pick the hour, not the minute, so these are windows
+rather than exact times, in the script project's timezone.
+
 ### `publish-my-time-off.js`
 
 | Function | What it does |
 | --- | --- |
-| `setupPublish` | Creates this script's triggers (hourly `publishMyTimeOff`, nightly `fullPublishMyTimeOff` at 04:00) and publishes once immediately. Only its own triggers are checked, so it coexists with `setup`. |
+| `setupPublish` | Creates this script's triggers (daily `publishMyTimeOff` between 08:00 and 09:00, weekly `fullPublishMyTimeOff` on Monday between 07:00 and 08:00) and publishes once immediately. Safe to re-run: it replaces its own triggers and leaves the team sync's alone. |
 | `publishMyTimeOff` | Incremental publish: only your events modified since each destination's last run. |
 | `fullPublishMyTimeOff` | Re-scans the whole window, ignoring checkpoints. |
 | `testPublishMyTimeOff` | **Dry run** over the next 7 days: logs what would be copied to each destination and writes nothing. |
@@ -228,10 +234,10 @@ instead.
    execution log. Each reports the window it scanned and, for the next 7 days,
    what it would import and remove. Nothing is written.
 9. **Go live.** Run `setup` for the team sync and/or `setupPublish` for
-   publishing. Each creates its own hourly and nightly triggers and performs a
-   first full run; each checks only its own triggers, so enabling both is fine.
-   To change a schedule later, delete the triggers under *Triggers* in the
-   editor and run the relevant setup function again.
+   publishing. Each creates its own daily and weekly triggers and performs a
+   first full run; each only ever touches its own triggers, so enabling both is
+   fine. To change a schedule later, edit the setup function and run it again —
+   it replaces its own triggers, so there is nothing to clean up by hand.
 
 For the team sync, the account running the script must be able to read the team
 members' calendars — in a Google Workspace domain this is normally the case for

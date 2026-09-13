@@ -136,7 +136,25 @@ test('setupPublish registers its own triggers and coexists with the team sync',(
  state.triggers.push('sync','fullSync');   // the team sync is already scheduled
  c.setupPublish();
  assert.deepEqual(state.triggers,['sync','fullSync','publishMyTimeOff','fullPublishMyTimeOff']);
- assert.throws(()=>c.setupPublish(),/already setup/);
+ assert.deepEqual(state.deletedTriggers,[]);
+});
+test('re-running setupPublish replaces its own triggers and keeps the team ones',()=>{
+ const {c,state}=withDestinations('a@group.calendar.google.com');
+ c.findEvents=()=>[];
+ state.triggers.push('sync','fullSync');
+ c.setupPublish();
+ c.setupPublish();
+ assert.deepEqual(state.deletedTriggers,['publishMyTimeOff','fullPublishMyTimeOff']);
+ assert.deepEqual(state.triggers,['sync','fullSync','publishMyTimeOff','fullPublishMyTimeOff']);
+});
+test('setupPublish schedules a daily publish at 08:00 and a full one on Monday at 07:00',()=>{
+ const {c,state}=withDestinations('a@group.calendar.google.com');
+ c.findEvents=()=>[];
+ c.setupPublish();
+ assert.deepEqual(state.triggerSpecs,[
+  {handler:'publishMyTimeOff',schedule:['everyDays:1','atHour:8']},
+  {handler:'fullPublishMyTimeOff',schedule:['onWeekDay:MONDAY','atHour:7']},
+ ]);
 });
 
 done();
