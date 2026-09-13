@@ -217,4 +217,37 @@ test('a calendar setting written as a plain list of IDs still works',()=>{
  assert.equal(c.calendarLabel({name:'a@example.com',id:'a@example.com'}),'a@example.com');
  assert.equal(c.calendarLabel({name:'Team',id:'a@example.com'}),'Team (a@example.com)');
 });
+test('log lines carry a readable date for every event shape',()=>{
+ const {c}=context();
+ const dates=(event)=>c.eventDates(event);
+ // All-day ends are reported inclusively, unlike the API's exclusive end date.
+ assert.equal(dates({start:{date:'2026-09-15'},end:{date:'2026-09-16'}}),'2026-09-15');
+ assert.equal(dates({start:{date:'2026-09-15'},end:{date:'2026-09-18'}}),'2026-09-15..2026-09-17');
+ assert.equal(dates({start:{dateTime:'2026-09-15T09:00:00Z'},end:{dateTime:'2026-09-15T17:00:00Z'}}),
+  '2026-09-15 09:00-17:00');
+ assert.equal(dates({start:{dateTime:'2026-09-15T22:00:00Z'},end:{dateTime:'2026-09-16T06:00:00Z'}}),
+  '2026-09-15 22:00 to 2026-09-16 06:00');
+ assert.equal(dates({recurrence:['RRULE:FREQ=WEEKLY'],start:{date:'2026-09-15'},end:{date:'2026-09-16'}}),
+  '2026-09-15, repeats');
+ // Local time is used when the event names a zone.
+ assert.equal(dates({start:{dateTime:'2026-09-15T22:00:00Z',timeZone:'Europe/Rome'},
+  end:{dateTime:'2026-09-15T23:00:00Z',timeZone:'Europe/Rome'}}),'2026-09-16 00:00-01:00');
+ // A cancellation stub carries no start at all and must not throw.
+ assert.equal(dates({id:'gone',status:'cancelled'}),'date unknown');
+ assert.equal(dates(undefined),'date unknown');
+});
+test('the import and removal logs name the date',()=>{
+ const {c,state}=context();
+ c.findEvents=()=>[{id:'a',summary:'PTO',start:{date:'2026-09-15'},end:{date:'2026-09-18'}}];
+ c.runSync();
+ assert.ok(state.logs.some((line)=>line==='Importing: [alice] Away on 2026-09-15..2026-09-17'));
+ const other=context();
+ other.c.findEvents=()=>[{id:'a',status:'cancelled'}];
+ other.c.Calendar.Events.list=()=>({items:[{id:'copy',summary:'[alice] Away',
+  start:{dateTime:'2026-09-15T09:00:00Z'},end:{dateTime:'2026-09-15T17:00:00Z'},
+  extendedProperties:{private:{awaySource:'alice@example.com/a'}}}]});
+ other.c.runSync();
+ assert.ok(other.state.logs.some((line)=>
+  line==='Removed: [alice] Away on 2026-09-15 09:00-17:00 (copy)'));
+});
 done();

@@ -131,6 +131,36 @@ function importedEventsLoader(calendarId) {
   return load;
 }
 
+/**
+ * A compact date range for the log: "2026-09-15" for a single all-day event,
+ * "2026-09-15..2026-09-17" for a longer one, "2026-09-15 09:00-17:00" for a
+ * timed one. All-day ends are reported inclusively, unlike the exclusive end
+ * date the API uses, because the log is read by people.
+ * @param {Calendar.Event} event Source event or imported copy.
+ * @return {string} The range, or "date unknown" for a cancellation stub that
+ *     carries no start at all.
+ */
+function eventDates(event) {
+  if (!event || !event.start || !event.end) return "date unknown";
+  const repeats = event.recurrence ? ", repeats" : "";
+  if (event.start.date) {
+    const last = new Date(`${event.end.date}T00:00:00Z`);
+    last.setUTCDate(last.getUTCDate() - 1);
+    const until = last.toISOString().slice(0, 10);
+    return (until <= event.start.date
+      ? event.start.date
+      : `${event.start.date}..${until}`) + repeats;
+  }
+  const zone = event.start.timeZone;
+  const from = eventLocalParts(event.start, zone);
+  const to = eventLocalParts(event.end, zone);
+  if (!from.date) return event.start.dateTime + repeats;
+  const hm = (time) => time.slice(0, 5);
+  return (from.date === to.date
+    ? `${from.date} ${hm(from.time)}-${hm(to.time)}`
+    : `${from.date} ${hm(from.time)} to ${to.date} ${hm(to.time)}`) + repeats;
+}
+
 /** Sync one member's calendar; any failure leaves its checkpoint unchanged. */
 function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEvents, window) {
   const username = email.split("@")[0];
@@ -153,16 +183,16 @@ function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEv
       calendarId, email, username, event, getImportedEvents(), window,
     )) {
       console.log(
-        "Outside the scan window, copy left in place: [%s] %s (%s)",
-        username, event.summary || "(no title)", event.id,
+        "Outside the scan window, copy left in place: [%s] %s on %s (%s)",
+        username, event.summary || "(no title)", eventDates(event), event.id,
       );
       skipped++;
       continue;
     }
     if (cancelled || outside || (strict && !isStrictMatch(event))) {
       console.log(
-        "Excluded or cancelled: [%s] %s (%s; %s)",
-        username, event.summary || "(no title)", event.id,
+        "Excluded or cancelled: [%s] %s on %s (%s; %s)",
+        username, event.summary || "(no title)", eventDates(event), event.id,
         cancelled ? "cancelled" :
           outside ? "rescheduled out of the scan window" : "not a strict match",
       );
@@ -174,11 +204,8 @@ function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEv
       const copy = JSON.parse(JSON.stringify(event));
       if (isAllDayEvent(copy)) convertToAllDay(copy);
       console.log(
-        "Would import as Free: %s (%s to %s%s)",
-        buildSummary(username, copy),
-        copy.start.date || copy.start.dateTime,
-        copy.end.date || copy.end.dateTime,
-        copy.start.date ? ", all day; end exclusive" : "",
+        "Would import as Free: %s on %s",
+        buildSummary(username, copy), eventDates(copy),
       );
       // Recorded like a real import, so a cancellation later in the same dry
       // run can still find this series and report the occurrence it would
@@ -407,8 +434,9 @@ function removeCopy(calendarId, copy, dryRun) {
   if (copy.status === "cancelled") return;
   if (dryRun) {
     console.log(
-      "Would remove: %s (%s)",
-      copy.summary, copy.pending ? "would be created in this run" : copy.id,
+      "Would remove: %s on %s (%s)",
+      copy.summary, eventDates(copy),
+      copy.pending ? "would be created in this run" : copy.id,
     );
     // Marked here too, so a copy reached by two different paths in one dry run
     // is only reported once.
@@ -416,7 +444,7 @@ function removeCopy(calendarId, copy, dryRun) {
   } else {
     Calendar.Events.remove(calendarId, copy.id);
     copy.status = "cancelled";
-    console.log("Removed: %s (%s)", copy.summary, copy.id);
+    console.log("Removed: %s on %s (%s)", copy.summary, eventDates(copy), copy.id);
   }
 }
 
@@ -607,7 +635,7 @@ function importEvent(calendarId, username, event, email) {
     event.focusTimeProperties = undefined;
   }
 
-  console.log("Importing: %s", event.summary);
+  console.log("Importing: %s on %s", event.summary, eventDates(event));
   // Let failures reach the per-user handler so this calendar is retried.
   return Calendar.Events.import(event, calendarId);
 }
