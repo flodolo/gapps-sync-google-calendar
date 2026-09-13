@@ -17,3 +17,5 @@ jobs:
         run: node tests/sync-team-calendar.test.cjs
       - name: Publish my time off tests
         run: node tests/publish-my-time-off.test.cjs
+      - name: Reconciliation tests
+        run: node tests/reconciliation.test.cjs

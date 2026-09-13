@@ -23,10 +23,17 @@ function load(files) {
 function context(files, configKeys = ['TEAM_CALENDAR_IDS']) {
   const state = {writes:0, removed:[], imports:[], released:0, properties:{}, logs:[], triggers:[], triggerSpecs:[], deletedTriggers:[]};
   const c = {
-    console:{log(...args){state.logs.push(util.format(...args));}, error(){}, warn(){}},
+    Date: class extends Date {
+      constructor(...args) { super(...(args.length ? args : ['2026-09-10T08:00:00Z'])); }
+      static now() { return new Date('2026-09-10T08:00:00Z').getTime(); }
+    },
+    // Warnings are recorded like logs so tests can assert on them; errors are
+    // discarded because the scripts log them on paths that also throw.
+    console:{log(...args){state.logs.push(util.format(...args));}, error(){},
+      warn(...args){state.logs.push(util.format(...args));}},
     LockService:{getScriptLock:()=>({waitLock(){}, releaseLock(){state.released++;}})},
     PropertiesService:{getScriptProperties:()=>({getProperties:()=>({...state.properties}),deleteProperty(key){delete state.properties[key];},getProperty:(key)=>state.properties[key] || null,setProperty(key,value){state.writes++;state.properties[key]=value;}})},
-    Session:{getEffectiveUser:()=>({getEmail:()=>'me@example.com'})},
+    Session:{getEffectiveUser:()=>({getEmail:()=>'me@example.com'}),getScriptTimeZone:()=>'UTC'},
     ScriptApp:{
       WeekDay:{MONDAY:'MONDAY',TUESDAY:'TUESDAY',WEDNESDAY:'WEDNESDAY',THURSDAY:'THURSDAY',FRIDAY:'FRIDAY',SATURDAY:'SATURDAY',SUNDAY:'SUNDAY'},
       getProjectTriggers:()=>state.triggers.map((h)=>({getHandlerFunction:()=>h})),
@@ -55,7 +62,7 @@ function context(files, configKeys = ['TEAM_CALENDAR_IDS']) {
       return pattern==='yyyy-MM-dd' ? `${parts.year}-${parts.month}-${parts.day}` : `${parts.hour}:${parts.minute}:${parts.second}`;
     }},
     Calendar:{
-      Events:{list:()=>({items:[]}),get(){throw Error('Not Found');},remove(cal,id){state.removed.push(id);},import(event,cal){state.imports.push(event);}},
+      Events:{list:()=>({items:[]}),get(){throw Error('Not Found');},remove(cal,id){state.removed.push(id);},import(event,cal){state.imports.push(event);return event;}},
       CalendarList:{get:()=>({summary:'Shared',accessRole:'writer'}),list:()=>({items:[]})},
       Acl:{list:()=>({items:[]})},
     },

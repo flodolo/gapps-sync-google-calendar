@@ -106,7 +106,7 @@ function performPublish(options) {
     return;
   }
 
-  const { today, maxDate } = syncWindow(options);
+  const { today, maxDate, timeZone } = syncWindow(options);
   const strict = strictMatchFor(options);
   const properties = PropertiesService.getScriptProperties();
   const email = Session.getEffectiveUser().getEmail();
@@ -129,9 +129,15 @@ function performPublish(options) {
       const events = findEvents(
         email, today, maxDate, lastRun ? new Date(lastRun) : null,
       );
+      const getImportedEvents = importedEventsLoader(calendarId);
+      if (!lastRun) {
+        reconcileMissingEvents(calendarId, email, events, { today, maxDate },
+          options.dryRun, getImportedEvents());
+      }
       const result = syncUserEvents(
         calendarId, email, events, strict, options.dryRun,
-        importedEventsLoader(calendarId),
+        getImportedEvents,
+        { today, maxDate, timeZone, incremental: Boolean(lastRun) },
       );
       count += result.count;
       skipped += result.skipped;

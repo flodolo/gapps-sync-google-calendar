@@ -100,7 +100,7 @@ function runSync(options = {}) {
 }
 
 function performSync(options) {
-  const { today, maxDate } = syncWindow(options);
+  const { today, maxDate, timeZone } = syncWindow(options);
 
   // Each calendar advances independently. Missing checkpoints trigger a full
   // scan, including the first run after upgrading from the global lastRun.
@@ -120,7 +120,7 @@ function performSync(options) {
     console.log("Team calendar: %s", calendarId);
     try {
       const result = syncTeamCalendar(
-        calendarId, today, maxDate, strict, options, properties,
+        calendarId, today, maxDate, strict, options, properties, timeZone,
       );
       count += result.count;
       skipped += result.skipped;
@@ -157,23 +157,12 @@ function performSync(options) {
  * @param {Properties} properties The script properties store.
  * @return {{count: number, skipped: number, failed: number}} Per-calendar tally.
  */
-function syncTeamCalendar(calendarId, today, maxDate, strict, options, properties) {
+function syncTeamCalendar(calendarId, today, maxDate, strict, options, properties, timeZone) {
   // Gets the list of people with write access to the team calendar.
   const users = getCalendarEditors(calendarId);
   console.log(`Found ${users.length} team members with write access`);
 
   const prefix = `lastRun:${calendarId}:`;
-  if (!options.dryRun) {
-    // Only this calendar's own keys are considered, so the checkpoints of the
-    // other team calendars are left alone.
-    const activeKeys = new Set(users.map((email) => `${prefix}${email}`));
-    for (const key of Object.keys(properties.getProperties())) {
-      if (key === "lastRun" || (key.startsWith(prefix) && !activeKeys.has(key))) {
-        properties.deleteProperty(key);
-      }
-    }
-  }
-
   // One loader for this calendar, shared by all of its members.
   const getImportedEvents = importedEventsLoader(calendarId);
 
@@ -183,6 +172,58 @@ function syncTeamCalendar(calendarId, today, maxDate, strict, options, propertie
   let count = 0;
   let skipped = 0;
   let failed = 0;
+  const activeKeys = new Set(users.map((email) => `${prefix}${email}`));
+  const departed = Object.keys(properties.getProperties()).filter(
+    (key) => key.startsWith(prefix) && !activeKeys.has(key),
+  );
+  if (!options.dryRun && properties.getProperty("lastRun")) {
+    properties.deleteProperty("lastRun");
+  }
+  // An ACL that returns nobody is indistinguishable from the whole team having
+  // left, and acting on it would strip every member's copies from the calendar
+  // in one unattended run. Sharing switched to a group, or a narrowed
+  // MEMBER_ROLES, both look exactly like that, so refuse instead.
+  if (departed.length && !users.length) {
+    console.warn(
+      "Skipping cleanup of %s checkpoint(s): the ACL returned no individual " +
+        "users, which is more likely a sharing change than a mass departure.",
+      departed.length,
+    );
+  } else {
+    for (const key of departed) {
+      const email = key.slice(prefix.length);
+      try {
+        // Publishing can independently keep this person's copies on this
+        // calendar, in which case they are not stale and must survive.
+        const publishingHere = typeof PUBLISH_CALENDAR_IDS !== "undefined" &&
+          PUBLISH_CALENDAR_IDS.includes(calendarId) &&
+          properties.getProperty(`lastPublish:${calendarId}:${email}`);
+        if (publishingHere) {
+          // The key is the only thing that would ever trigger this cleanup, so
+          // it is kept rather than dropped: if publishing to this calendar
+          // stops later, the copies are still reclaimable.
+          console.log(
+            "Keeping %s: that account still publishes to this calendar", key,
+          );
+          continue;
+        }
+        const index = getImportedEvents();
+        for (const [source, copies] of index.bySource) {
+          if (!source.startsWith(`${email}/`)) continue;
+          for (const copy of copies) {
+            if (copyOverlapsWindow(calendarId, copy, today, null, index.timeZone)) {
+              removeCopy(calendarId, copy, options.dryRun);
+            }
+          }
+        }
+        // Keep this key until cleanup succeeds, so a failed removal is retried.
+        if (!options.dryRun) properties.deleteProperty(key);
+      } catch (error) {
+        failed++;
+        console.error("Cleanup failed for %s: %s; will retry next run", email, String(error));
+      }
+    }
+  }
   for (const email of users) {
     const checkpoint = `${prefix}${email}`;
     try {
@@ -192,8 +233,13 @@ function syncTeamCalendar(calendarId, today, maxDate, strict, options, propertie
       const events = findEvents(
         email, today, maxDate, lastRun ? new Date(lastRun) : null,
       );
+      if (!lastRun) {
+        reconcileMissingEvents(calendarId, email, events, { today, maxDate },
+          options.dryRun, getImportedEvents());
+      }
       const result = syncUserEvents(
         calendarId, email, events, strict, options.dryRun, getImportedEvents,
+        { today, maxDate, timeZone, incremental: Boolean(lastRun) },
       );
       count += result.count;
       skipped += result.skipped;

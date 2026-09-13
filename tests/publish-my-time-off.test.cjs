@@ -81,7 +81,7 @@ test('incremental runs pass each destination its own checkpoint',()=>{
  const {c,state}=withDestinations('a@group.calendar.google.com','b@group.calendar.google.com');
  state.properties['lastPublish:a@group.calendar.google.com:me@example.com']='2026-09-01T00:00:00.000Z';
  const since=[];
- c.Calendar.Events.list=(cal,params)=>{since.push(params.updatedMin);return {items:[]};};
+ c.Calendar.Events.list=(cal,params)=>{if(cal==='me@example.com')since.push(params.updatedMin);return {items:[]};};
  c.runPublish();
  assert.deepEqual(since,['2026-09-01T00:00:00.000Z',undefined]);
 });
@@ -111,6 +111,7 @@ test('one failing destination does not stop the others, and it retries',()=>{
  c.Calendar.Events.import=(event,cal)=>{
   if(cal==='bad@group.calendar.google.com' && broken) throw Error('403');
   state.imports.push(event);
+  return event;
  };
  assert.throws(()=>c.runPublish(),/1 destination calendar\(s\) failed/);
  assert.equal(state.imports.length,1);

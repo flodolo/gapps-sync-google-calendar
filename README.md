@@ -32,6 +32,7 @@ tests/
   helpers.cjs             stubbed Apps Script services for both suites
   sync-team-calendar.test.cjs
   publish-my-time-off.test.cjs
+  reconciliation.test.cjs
 ```
 
 `scripts/` holds exactly the files that get uploaded to the Apps Script
@@ -56,8 +57,12 @@ steps below run once per calendar.
    into the team calendar as `[username] Away`, shown as **Free** so they do
    not affect anyone's availability, and with reminders disabled so nobody is
    notified about someone else's time off.
-4. Events that no longer qualify — cancelled, renamed out of the keyword list —
+4. Events that no longer qualify — cancelled, renamed out of the keyword list,
+   or rescheduled outside the scan window —
    have their previously imported copy removed from the team calendar.
+5. When a previously synced member loses write access, their tagged future
+   copies are removed before their checkpoint is discarded. Copies still
+   managed by the publish script in this project are kept.
 
 ### Publishing your own time off (`publish-my-time-off.js`)
 
@@ -74,8 +79,8 @@ steps below run once per calendar.
    rules as the team sync: `STRICT_MATCH` decides what counts,
    `SANITIZE_EVENTS` strips private details, whole-day events are rewritten as
    all-day, and copies are shown as Free with no reminders and no attendees.
-4. Copies are removed again when the source event is cancelled or stops
-   matching, in every destination.
+4. Copies are removed again when the source event is cancelled, stops matching,
+   or moves outside the scan window, in every destination.
 
 Listing the same calendar in both settings is harmless. Copies are matched by
 source event, so the two scripts converge on a single copy rather than creating
@@ -94,6 +99,33 @@ Some details worth knowing:
   Incremental runs only look at events modified since that timestamp. If one
   calendar fails (revoked access, API error), its checkpoint is left untouched
   so the next run retries it, while the other calendars still advance.
+- **Reconciliation.** Incremental runs fetch changes without date bounds, so
+  rescheduling an event out of the window still removes the copy left at its
+  old position. An event outside the window whose copy still agrees with it is
+  left alone instead: that copy is an accurate record of time off that merely
+  happened already, and deleting it would erase history every time an old
+  event was edited. A single occurrence moved out of the window is judged the
+  same way, by comparing it against its original start, since its copy belongs
+  to the imported series rather than carrying the occurrence's own id. Full runs also compare tagged copies in the window against
+  the complete source results, repairing stale copies missed by earlier runs.
+  Untagged events and other people's copies are left alone by this comparison.
+- **Recurring events.** Cancelling one occurrence removes only that occurrence
+  from the imported series, including series converted to all-day events.
+  Cleanup checks occurrences rather than the series' original start date.
+  When an entire series no longer belongs on the destination, its imported
+  master is removed, including its past occurrences. Completed series and
+  past standalone events are retained during full reconciliation and
+  departed-member cleanup.
+- **Departed members.** When someone no longer has write access, their future
+  copies are removed and their checkpoint is dropped — but only after the
+  removal succeeds, and never while `PUBLISH_CALENDAR_IDS` shows they are still
+  publishing to that same calendar, in which case the checkpoint is kept so the
+  copies stay reclaimable. If the ACL returns *no* individual users at all, no
+  cleanup happens: switching a calendar's sharing to a group, or narrowing
+  `MEMBER_ROLES`, is indistinguishable from the entire team leaving, and acting
+  on it would strip the calendar in one unattended run.
+- **Time zones.** Date-only comparisons use the destination calendar's time
+  zone when the API reports one, and the script project's own zone otherwise.
 - **No reminders, no invitations.** Copies are written with
   `reminders: { useDefault: false, overrides: [] }` and an empty attendee list.
   Without the explicit reminder override a copy would inherit the source
@@ -250,13 +282,15 @@ calendar, so it has no such requirement.
 ```
 node tests/sync-team-calendar.test.cjs
 node tests/publish-my-time-off.test.cjs
+node tests/reconciliation.test.cjs
 ```
 
-Each suite runs its script, plus `common.js`, in a `vm` context with the Apps
+Each suite runs its scripts, plus `common.js`, in a `vm` context with the Apps
 Script services stubbed out (`Calendar`, `PropertiesService`, `LockService`,
 `ScriptApp`, `Session`, `Utilities`) by `tests/helpers.cjs`. They load
 `scripts/config.dist.js`, not `scripts/config.js`, so a local configuration
-cannot change the outcome. No dependencies beyond Node. Both suites run in CI
+cannot change the outcome. The clock is fixed so date-window tests are stable.
+No dependencies beyond Node. All suites run in CI
 on every push to `main` and on every pull request.
 
 ## Differences from the Google sample

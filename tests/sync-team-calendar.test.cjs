@@ -68,6 +68,7 @@ test('inaccessible calendar does not block later users, and recovery retries',()
  state.properties[aliceKey]='2026-09-01T00:00:00.000Z';
  c.getCalendarEditors=()=>['alice@example.com','bob@example.com'];
  c.Calendar.Events.list=(email,params)=>{
+  if(email===config.TEAM_CALENDAR_IDS[0]) return {items:[]};
   calls.push({email,since:params.updatedMin});
   if(email==='alice@example.com' && broken) throw Error('Not Found');
   return {items:[]};
@@ -103,8 +104,10 @@ test('many exclusions across users share one paginated lookup and log reasons',(
  assert.equal(state.logs.filter(line=>line.startsWith('Excluded or cancelled:')).length,200);
  assert.ok(state.logs.some(line=>line.startsWith('Removed:')));
 });
-test('runs without exclusions never load destination calendar',()=>{
- const {c}=context();c.findEvents=()=>[];c.Calendar.Events.list=()=>assert.fail('Unexpected destination lookup');c.runSync();
+test('incremental runs without exclusions never load destination calendar',()=>{
+ const {c,state,config}=context();
+ state.properties[`lastRun:${config.TEAM_CALENDAR_IDS[0]}:alice@example.com`]='2026-08-31T08:00:00Z';
+ c.findEvents=()=>[];c.Calendar.Events.list=()=>assert.fail('Unexpected destination lookup');c.runSync();
 });
 test('cleanup removes only legacy and departed-user state for this team',()=>{
  const {c,state,config}=context();const prefix=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:`;

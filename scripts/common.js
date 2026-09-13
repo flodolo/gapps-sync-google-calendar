@@ -62,7 +62,7 @@ function syncWindow(options) {
     formatDateAsRFC3339(maxDate),
     options.dryRun ? " (dry run)" : "",
   );
-  return { today, maxDate };
+  return { today, maxDate, timeZone: scriptTimeZone() };
 }
 
 /**
@@ -77,8 +77,8 @@ function strictMatchFor(options) {
 /**
  * Builds a memoized loader for a destination calendar's existing copies. One
  * loader per destination calendar, shared by every person synced into it, so
- * the calendar is paginated at most once per run and only when an exclusion
- * actually needs reconciling.
+ * the calendar is paginated at most once per run. Imports are added to the
+ * index so a later cancellation can find a series created in the same run.
  * @param {string} calendarId The destination calendar.
  * @return {function(): Object} Returns the index, loading it on first call.
  */
@@ -86,23 +86,55 @@ function importedEventsLoader(calendarId) {
   // No date bounds on the lookup: a cancelled or rescheduled source can refer
   // to a copy outside the scanned window.
   let importedEvents;
-  return () => {
-    if (!importedEvents) importedEvents = listImportedEvents(calendarId);
+  const pending = [];
+  const load = () => {
+    if (!importedEvents) {
+      importedEvents = listImportedEvents(calendarId);
+      for (const copy of pending) indexImportedEvent(importedEvents, copy);
+    }
     return importedEvents;
   };
+  load.remember = (copy) => {
+    if (importedEvents) indexImportedEvent(importedEvents, copy);
+    else pending.push(copy);
+  };
+  return load;
 }
 
 /** Sync one member's calendar; any failure leaves its checkpoint unchanged. */
-function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEvents) {
+function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEvents, window) {
   const username = email.split("@")[0];
   let count = 0;
   let skipped = 0;
-  for (const event of events) {
-    if (event.status === "cancelled" || (strict && !isStrictMatch(event))) {
+  // API result order is unspecified. Create series before processing exceptions.
+  const ordered = [...events].sort((a, b) =>
+    Number(Boolean(a.recurringEventId)) - Number(Boolean(b.recurringEventId)));
+  for (const event of ordered) {
+    const cancelled = event.status === "cancelled";
+    // Incremental scans carry no date bounds, so events from outside the window
+    // come back too. Such an event is not imported, but whether its existing
+    // copy should go depends on why it is outside: a copy that still agrees
+    // with the source is a faithful record of time off that merely happens to
+    // be in the past, and a full sync would keep it. Only a copy left behind at
+    // a position the source has since abandoned is stale.
+    const outside = !cancelled && window && window.incremental &&
+      !sourceEventInWindow(email, event, window);
+    if (outside && !hasStaleCopy(
+      calendarId, email, username, event, getImportedEvents(), window,
+    )) {
+      console.log(
+        "Outside the scan window, copy left in place: [%s] %s (%s)",
+        username, event.summary || "(no title)", event.id,
+      );
+      skipped++;
+      continue;
+    }
+    if (cancelled || outside || (strict && !isStrictMatch(event))) {
       console.log(
         "Excluded or cancelled: [%s] %s (%s; %s)",
         username, event.summary || "(no title)", event.id,
-        event.status === "cancelled" ? "cancelled" : "not a strict match",
+        cancelled ? "cancelled" :
+          outside ? "rescheduled out of the scan window" : "not a strict match",
       );
       removeImportedEvent(calendarId, email, username, event, dryRun, getImportedEvents());
       skipped++;
@@ -118,12 +150,99 @@ function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEv
         copy.end.date || copy.end.dateTime,
         copy.start.date ? ", all day; end exclusive" : "",
       );
+      // Recorded like a real import, so a cancellation later in the same dry
+      // run can still find this series and report the occurrence it would
+      // remove. 'pending' marks it as not actually present on the calendar.
+      getImportedEvents.remember({
+        id: `pending:${event.id}`,
+        iCalUID: event.iCalUID,
+        summary: buildSummary(username, copy),
+        recurrence: copy.recurrence,
+        start: copy.start,
+        end: copy.end,
+        pending: true,
+        extendedProperties: { private: { awaySource: `${email}/${event.id}` } },
+      });
     } else {
-      importEvent(calendarId, username, event, email);
+      getImportedEvents.remember(importEvent(calendarId, username, event, email));
     }
     count++;
   }
   return { count, skipped };
+}
+
+/**
+ * Whether a source event belongs in the scan window.
+ *
+ * The lower edge is pulled back a day rather than using the exact moment the
+ * run started, so an event that ended a few hours ago is still treated as
+ * current: re-importing it is a harmless no-op, whereas treating it as outside
+ * puts its copy through the staleness test needlessly.
+ */
+function sourceEventInWindow(email, event, window) {
+  const from = new Date(window.today.getTime() - 24 * 60 * 60 * 1000);
+  if (event.recurrence) {
+    // The first occurrence may be years old; ask about occurrences instead.
+    return hasOccurrences(email, event.id, from, window.maxDate);
+  }
+  return eventOverlapsWindow(event, from, window.maxDate, window.timeZone);
+}
+
+/**
+ * The project's own time zone, used for date-only comparisons when the calendar
+ * involved did not report one. Better than assuming UTC, which is a day out for
+ * anyone far enough east or west.
+ */
+function scriptTimeZone() {
+  try {
+    return Session.getScriptTimeZone() || "UTC";
+  } catch (error) {
+    return "UTC";
+  }
+}
+
+function hasOccurrences(calendarId, eventId, start, end) {
+  let pageToken;
+  do {
+    const params = {timeMin: formatDateAsRFC3339(start),
+      maxResults: 1, showDeleted: false, pageToken};
+    if (end) params.timeMax = formatDateAsRFC3339(end);
+    const response = Calendar.Events.instances(calendarId, eventId, params);
+    if ((response.items || []).some((item) => item.status !== "cancelled")) return true;
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+  return false;
+}
+
+/** Date-only boundaries use the given zone, falling back to the project's. */
+function eventOverlapsWindow(event, start, end, timeZone) {
+  timeZone = timeZone || scriptTimeZone();
+  if (!event.start || !event.end) return false;
+  if (event.start.date) {
+    return event.end.date > Utilities.formatDate(start, timeZone, "yyyy-MM-dd") &&
+      (!end || event.start.date <= Utilities.formatDate(end, timeZone, "yyyy-MM-dd"));
+  }
+  return new Date(event.end.dateTime) > start &&
+    (!end || new Date(event.start.dateTime) < end);
+}
+
+function copyOverlapsWindow(calendarId, copy, start, end, timeZone) {
+  if (copy.status === "cancelled") return false;
+  return copy.recurrence ? hasOccurrences(calendarId, copy.id, start, end) :
+    eventOverlapsWindow(copy, start, end, timeZone);
+}
+
+/** A full source snapshot can repair copies missed by earlier incremental runs. */
+function reconcileMissingEvents(calendarId, email, events, window, dryRun, index) {
+  const present = new Set(events.map((event) => `${email}/${event.id}`));
+  for (const [source, copies] of index.bySource) {
+    if (!source.startsWith(`${email}/`) || present.has(source)) continue;
+    for (const copy of copies) {
+      if (copyOverlapsWindow(calendarId, copy, window.today, window.maxDate, index.timeZone)) {
+        removeCopy(calendarId, copy, dryRun);
+      }
+    }
+  }
 }
 
 /**
@@ -224,53 +343,193 @@ function eventLocalParts(boundary, timeZone) {
 /** Read the given team calendar once and index copies for local matching. */
 function listImportedEvents(calendarId) {
   const index = { bySource: new Map(), byId: new Map(), byUID: new Map() };
-  const add = (map, key, event) => {
-    if (!key) return;
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(event);
-  };
   let pageToken;
   do {
     const response = Calendar.Events.list(calendarId, {
       pageToken, maxResults: 2500, showDeleted: false,
     });
+    if (response.timeZone) index.timeZone = response.timeZone;
     for (const copy of response.items || []) {
       if (copy.status === "cancelled") continue;
-      const source = copy.extendedProperties && copy.extendedProperties.private;
-      add(index.bySource, source && source.awaySource, copy);
-      add(index.byId, copy.id, copy);
-      add(index.byUID, copy.iCalUID, copy);
+      indexImportedEvent(index, copy);
     }
     pageToken = response.nextPageToken;
   } while (pageToken);
   return index;
 }
 
-/** Remove only copies identifiable as this script's imports. */
-function removeImportedEvent(calendarId, email, username, event, dryRun, index) {
-  let candidates = index.bySource.get(`${email}/${event.id}`) || [];
+function indexImportedEvent(index, copy) {
+  const add = (map, key) => {
+    if (!key) return;
+    const copies = map.get(key) || [];
+    const position = copies.findIndex((item) => item.id === copy.id);
+    if (position === -1) copies.push(copy);
+    else copies[position] = copy;
+    map.set(key, copies);
+  };
+  const properties = copy.extendedProperties && copy.extendedProperties.private;
+  add(index.bySource, properties && properties.awaySource);
+  add(index.byId, copy.id);
+  add(index.byUID, copy.iCalUID);
+}
+
+function removeCopy(calendarId, copy, dryRun) {
+  if (copy.status === "cancelled") return;
+  if (dryRun) {
+    console.log(
+      "Would remove: %s (%s)",
+      copy.summary, copy.pending ? "would be created in this run" : copy.id,
+    );
+    // Marked here too, so a copy reached by two different paths in one dry run
+    // is only reported once.
+    copy.status = "cancelled";
+  } else {
+    Calendar.Events.remove(calendarId, copy.id);
+    copy.status = "cancelled";
+    console.log("Removed: %s (%s)", copy.summary, copy.id);
+  }
+}
+
+/**
+ * The copies of one source event that this script is entitled to delete.
+ * @return {Calendar.Event[]} Matching copies, tagged ones preferred.
+ */
+function importedCopiesFor(email, username, event, index) {
+  const tagged = index.bySource.get(`${email}/${event.id}`) || [];
+  if (tagged.length) return tagged;
   // Legacy copies have no source tag. Retain the ID/UID and title checks,
   // without making requests for each excluded source event.
   const isLegacyCopy = (copy) =>
     !(copy.extendedProperties && copy.extendedProperties.private &&
       copy.extendedProperties.private.awaySource) &&
     (copy.summary || "").startsWith(`[${username}] `);
-  if (!candidates.length) {
-    candidates = (index.byId.get(event.id) || []).filter(isLegacyCopy);
-  }
-  if (!candidates.length && event.iCalUID && !event.recurringEventId) {
-    candidates = (index.byUID.get(event.iCalUID) || []).filter(
+  const byId = (index.byId.get(event.id) || []).filter(isLegacyCopy);
+  if (byId.length) return byId;
+  if (event.iCalUID && !event.recurringEventId) {
+    return (index.byUID.get(event.iCalUID) || []).filter(
       (copy) => !copy.recurringEventId && isLegacyCopy(copy),
     );
   }
-  for (const copy of candidates) {
-    if (copy.status === "cancelled") continue;
-    if (dryRun) {
-      console.log("Would remove: %s (%s)", copy.summary, copy.id);
-    } else {
-      Calendar.Events.remove(calendarId, copy.id);
-      copy.status = "cancelled";
-      console.log("Removed: %s (%s)", copy.summary, copy.id);
+  return [];
+}
+
+/**
+ * Where an import of this event would sit on the destination, accounting for
+ * the whole-day rewrite that import applies.
+ */
+function expectedCopyTimes(event) {
+  const copy = JSON.parse(JSON.stringify(event));
+  if (isAllDayEvent(copy)) convertToAllDay(copy);
+  return { start: copy.start, end: copy.end };
+}
+
+function boundaryKey(boundary) {
+  if (!boundary) return "";
+  if (boundary.date) return boundary.date;
+  return boundary.dateTime ? new Date(boundary.dateTime).toISOString() : "";
+}
+
+/**
+ * Whether an existing copy still sits where the source event now says it
+ * should. A copy that matches is a faithful record, even if it falls outside
+ * the scan window; one that does not is a leftover of an earlier position.
+ */
+function copyMatchesSource(copy, expected) {
+  return boundaryKey(copy.start) === boundaryKey(expected.start) &&
+    boundaryKey(copy.end) === boundaryKey(expected.end);
+}
+
+/**
+ * Whether two event boundaries denote the same point, tolerating one being
+ * date-only and the other timed.
+ */
+function sameBoundary(a, b, timeZone) {
+  if (!a || !b) return false;
+  if (a.date && b.date) return a.date === b.date;
+  if (a.dateTime && b.dateTime) {
+    return new Date(a.dateTime).getTime() === new Date(b.dateTime).getTime();
+  }
+  const dated = a.date ? a : b;
+  const timed = a.date ? b : a;
+  if (!timed.dateTime) return false;
+  return dated.date === eventLocalParts(timed, timed.timeZone || timeZone).date;
+}
+
+/**
+ * True when a copy exists that no longer agrees with the source event. Only
+ * asked about sources already known to fall outside the scan window.
+ */
+function hasStaleCopy(calendarId, email, username, event, index, window) {
+  if (event.recurringEventId && event.originalStartTime) {
+    // The copy of a single occurrence belongs to the imported series, so it
+    // carries the master's tag and its own destination id: the lookup below
+    // cannot see it. It is stale exactly when the occurrence has moved away
+    // from the slot the copy still occupies, which is also the one case
+    // removeImportedEvent() can resolve through the master's instances.
+    return !sameBoundary(
+      event.start, event.originalStartTime, window && window.timeZone,
+    );
+  }
+  const expected = expectedCopyTimes(event);
+  return importedCopiesFor(email, username, event, index).some((copy) => {
+    if (copy.status === "cancelled") return false;
+    // A copied series generates occurrences of its own from its own recurrence
+    // rule. If any of them land in the window that the source no longer
+    // covers, the copy is showing time off that is not happening.
+    if (copy.recurrence && !copy.pending) {
+      return copyOverlapsWindow(
+        calendarId, copy, window.today, window.maxDate, index.timeZone,
+      );
+    }
+    return !copyMatchesSource(copy, expected);
+  });
+}
+
+/** Remove only copies identifiable as this script's imports. */
+function removeImportedEvent(calendarId, email, username, event, dryRun, index) {
+  const candidates = importedCopiesFor(email, username, event, index);
+  const isLegacyCopy = (copy) =>
+    !(copy.extendedProperties && copy.extendedProperties.private &&
+      copy.extendedProperties.private.awaySource) &&
+    (copy.summary || "").startsWith(`[${username}] `);
+  for (const copy of candidates) removeCopy(calendarId, copy, dryRun);
+
+  if (event.recurringEventId && event.originalStartTime) {
+    const masters = index.bySource.get(`${email}/${event.recurringEventId}`) ||
+      (index.byId.get(event.recurringEventId) || []).filter(isLegacyCopy);
+    for (const master of masters) {
+      if (master.status === "cancelled" || !master.recurrence) continue;
+      // A whole-day OOO series was converted from timed to date-only on import.
+      const original = event.originalStartTime;
+      const originalStart = master.start.date
+        ? original.date || eventLocalParts(original, original.timeZone).date
+        : original.dateTime;
+      if (!originalStart) {
+        // Throwing here would leave the checkpoint unadvanced, so the same
+        // malformed exception would come back and fail the member on every
+        // later run. One unreconciled occurrence is the smaller problem.
+        console.warn(
+          "Cannot place occurrence %s of %s: unusable originalStartTime %s",
+          event.id, master.id, JSON.stringify(original),
+        );
+        continue;
+      }
+      if (master.pending) {
+        // The series itself would only be created by this same dry run, so
+        // there is nothing to enumerate on the calendar.
+        console.log(
+          "Would remove the %s occurrence of %s", originalStart, master.summary,
+        );
+        continue;
+      }
+      let pageToken;
+      do {
+        const response = Calendar.Events.instances(calendarId, master.id, {
+          originalStart, showDeleted: false, pageToken,
+        });
+        for (const instance of response.items || []) removeCopy(calendarId, instance, dryRun);
+        pageToken = response.nextPageToken;
+      } while (pageToken);
     }
   }
 }
@@ -320,13 +579,13 @@ function importEvent(calendarId, username, event, email) {
 
   console.log("Importing: %s", event.summary);
   // Let failures reach the per-user handler so this calendar is retried.
-  Calendar.Events.import(event, calendarId);
+  return Calendar.Events.import(event, calendarId);
 }
 
 /**
- * In a given user's calendar, looks for occurrences of the given keyword
- * in events within the specified date range and returns any such events
- * found.
+ * Lists out-of-office events. Full scans use the date range; incremental scans
+ * fetch all changes, including events moved out of that range. Matching and
+ * window filtering happen in syncUserEvents(), where old copies can be removed.
  * @param {string} email The email address of the user to retrieve events for.
  * @param {Date} start The starting date of the range to examine.
  * @param {Date} end The ending date of the range to examine.
@@ -336,15 +595,14 @@ function importEvent(calendarId, username, event, email) {
 function findEvents(email, start, end, optSince) {
   const params = {
     eventTypes: "outOfOffice",
-    timeMin: formatDateAsRFC3339(start),
-    timeMax: formatDateAsRFC3339(end),
     showDeleted: true,
   };
   if (optSince) {
-    // This prevents the script from examining events that have not been
-    // modified since the specified date (that is, the last time the
-    // script was run).
+    // Combining updatedMin with date bounds would hide rescheduled events.
     params.updatedMin = formatDateAsRFC3339(optSince);
+  } else {
+    params.timeMin = formatDateAsRFC3339(start);
+    params.timeMax = formatDateAsRFC3339(end);
   }
   let pageToken = null;
   let events = [];
