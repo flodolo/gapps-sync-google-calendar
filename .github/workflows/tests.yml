@@ -13,5 +13,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Run tests
+      - name: Team calendar sync tests
         run: node tests/sync-team-calendar.test.cjs
+      - name: Publish my time off tests
+        run: node tests/publish-my-time-off.test.cjs

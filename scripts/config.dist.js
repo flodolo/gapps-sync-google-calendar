@@ -17,6 +17,17 @@ const TEAM_CALENDAR_IDS = [
   "your-calendar-id@group.calendar.google.com",
 ];
 
+// Calendars that your own out-of-office events are published to by
+// publish-my-time-off.js. Leave empty to disable that script.
+//
+// This is the reverse direction of TEAM_CALENDAR_IDS: instead of pulling the
+// whole team's time off into a calendar you administer, it pushes only your own
+// time off to calendars you merely have write access to. The two are
+// independent, and listing the same calendar in both is harmless: copies are
+// matched by source event, so the two scripts converge on one copy rather than
+// creating two.
+const PUBLISH_CALENDAR_IDS = [];
+
 // Calendar ACL roles that identify a team member: their personal calendar is
 // scanned for out-of-office events. 'writer' is "Make changes to events",
 // 'owner' is "Make changes and manage sharing".

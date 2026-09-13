@@ -1,35 +1,8 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const vm = require('node:vm');
-const path = require('node:path');
-// Tests always run against the reference configuration, so a local config.js
-// cannot change their outcome.
-const source = ['config.dist.js', 'sync-team-calendar.js']
-  .map((file) => fs.readFileSync(path.join(__dirname, '..', 'scripts', file), 'utf8'))
-  .join('\n');
-let passed = 0;
-function test(name, fn) { fn(); passed++; console.log('PASS', name); }
-function context() {
-  const state = {writes:0, removed:[], imports:[], released:0, properties:{}, logs:[]};
-  const c = {
-    console:{log(...args){state.logs.push(require('node:util').format(...args));}, error(){}},
-    LockService:{getScriptLock:()=>({waitLock(){}, releaseLock(){state.released++;}})},
-    PropertiesService:{getScriptProperties:()=>({getProperties:()=>({...state.properties}),deleteProperty(key){delete state.properties[key];},getProperty:(key)=>state.properties[key] || null,setProperty(key,value){state.writes++;state.properties[key]=value;}})},
-    Utilities:{formatDate(date, timeZone, pattern) {
-      if (pattern.includes("yyyy-MM-dd'T'")) return date.toISOString();
-      const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(date).map(p=>[p.type,p.value]));
-      return pattern==='yyyy-MM-dd' ? `${parts.year}-${parts.month}-${parts.day}` : `${parts.hour}:${parts.minute}:${parts.second}`;
-    }},
-    Calendar:{Events:{list:()=>({items:[]}),get(){throw Error('Not Found');},remove(cal,id){state.removed.push(id);},import(event){state.imports.push(event);}}},
-  };
-  vm.createContext(c); vm.runInContext(source,c);
-  c.getCalendarEditors=()=>['alice@example.com'];
-  // Config constants are lexical declarations, so they are not properties of
-  // the context object and have to be read from inside it.
-  const config=vm.runInContext('({TEAM_CALENDAR_IDS})',c);
-  return {c,state,config};
-}
-function timed(start,end,zone) {return {id:'source',summary:'Appointment',start:{dateTime:start,timeZone:zone},end:{dateTime:end,timeZone:zone}};}
+const {context: makeContext, timed, runner} = require('./helpers.cjs');
+
+const {test, done} = runner();
+const context = () => makeContext(['sync-team-calendar.js']);
 test('partial final day remains timed and fails strict matching',()=>{
  const {c}=context(),e=timed('2026-09-12T00:00:00Z','2026-09-13T12:00:00Z');
  assert.equal(c.isAllDayEvent(e),false);assert.equal(c.isStrictMatch(e),false);
@@ -153,8 +126,8 @@ test('tagged copies for another source are not removed by legacy fallback',()=>{
  c.runSync();assert.equal(state.removed.length,0);
 });
 test('each team calendar syncs independently with its own members and checkpoints',()=>{
- const {c,state,config}=context();
- vm.runInContext('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")',c);
+ const {c,state,config,run}=context();
+ run('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")');
  const [first,second]=config.TEAM_CALENDAR_IDS;
  c.getCalendarEditors=(calendarId)=>calendarId===first?['alice@example.com']:['bob@example.com'];
  c.findEvents=(email)=>[{id:`src-${email}`,summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}}];
@@ -166,8 +139,8 @@ test('each team calendar syncs independently with its own members and checkpoint
  assert.equal(state.properties[`lastRun:${first}:bob@example.com`],undefined);
 });
 test('one unreachable team calendar does not stop the others',()=>{
- const {c,state,config}=context();
- vm.runInContext('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")',c);
+ const {c,state,config,run}=context();
+ run('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")');
  const [first,second]=config.TEAM_CALENDAR_IDS;
  c.getCalendarEditors=(calendarId)=>{if(calendarId===first)throw Error('ACL unavailable');return ['bob@example.com'];};
  c.findEvents=()=>[];
@@ -176,8 +149,8 @@ test('one unreachable team calendar does not stop the others',()=>{
  assert.equal(state.released,1);
 });
 test('a failing member on one calendar leaves the other calendar advancing',()=>{
- const {c,state,config}=context();
- vm.runInContext('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")',c);
+ const {c,state,config,run}=context();
+ run('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")');
  const [first,second]=config.TEAM_CALENDAR_IDS;
  c.getCalendarEditors=()=>['alice@example.com'];
  let calls=0;
@@ -186,4 +159,12 @@ test('a failing member on one calendar leaves the other calendar advancing',()=>
  assert.equal(state.properties[`lastRun:${first}:alice@example.com`],undefined);
  assert.ok(state.properties[`lastRun:${second}:alice@example.com`]);
 });
-console.log(`${passed} tests passed`);
+test('setup registers its own triggers and tolerates the publish ones',()=>{
+ const {c,state}=context();
+ c.findEvents=()=>[];
+ state.triggers.push('publishMyTimeOff');   // publish-my-time-off.js is scheduled
+ c.setup();
+ assert.deepEqual(state.triggers,['publishMyTimeOff','sync','fullSync']);
+ assert.throws(()=>c.setup(),/already setup/);
+});
+done();
