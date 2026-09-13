@@ -17,26 +17,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Set the ID of the team calendar to add events to. You can find the calendar's
-// ID on the settings page.
-const TEAM_CALENDAR_ID = "your-calendar-id@group.calendar.google.com";
-// Calendar ACL roles that identify a team member. 'writer' is "Make changes to
-// events", 'owner' is "Make changes and manage sharing".
-const MEMBER_ROLES = ["writer", "owner"];
-
-const KEYWORDS = ['vacation', 'ooo', 'pto', 'wellness', 'holiday', 'on leave'];
-const MONTHS_IN_ADVANCE = 3;
-
-// When true, timed out-of-office events are imported only if their title
-// contains one of KEYWORDS; all-day events are always imported. When false,
-// every out-of-office event in the window is imported.
-const STRICT_MATCH = true;
-
-// When true, the original event title, description and location are discarded
-// and the imported event is titled '[username] Away'. Keeps private details
-// from personal calendars off the shared team calendar.
-const SANITIZE_EVENTS = true;
-const SANITIZED_TITLE = "Away";
+// Configuration lives in config.js (copy config.dist.js to create it). In Apps
+// Script all files share one global scope, so TEAM_CALENDAR_ID, MEMBER_ROLES,
+// KEYWORDS, MONTHS_IN_ADVANCE, STRICT_MATCH, SANITIZE_EVENTS and
+// SANITIZED_TITLE are defined there and used directly below.
 
 /**
  * Sets up the script to run automatically: an hourly incremental sync, plus a

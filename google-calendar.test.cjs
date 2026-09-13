@@ -1,7 +1,12 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync(require('node:path').join(__dirname, 'google-calendar.js'), 'utf8');
+const path = require('node:path');
+// Tests always run against the reference configuration, so a local config.js
+// cannot change their outcome.
+const source = ['config.dist.js', 'google-calendar.js']
+  .map((file) => fs.readFileSync(path.join(__dirname, file), 'utf8'))
+  .join('\n');
 let passed = 0;
 function test(name, fn) { fn(); passed++; console.log('PASS', name); }
 function context() {
@@ -19,7 +24,10 @@ function context() {
   };
   vm.createContext(c); vm.runInContext(source,c);
   c.getCalendarEditors=()=>['alice@example.com'];
-  return {c,state};
+  // Config constants are lexical declarations, so they are not properties of
+  // the context object and have to be read from inside it.
+  const config=vm.runInContext('({TEAM_CALENDAR_ID})',c);
+  return {c,state,config};
 }
 function timed(start,end,zone) {return {id:'source',summary:'Appointment',start:{dateTime:start,timeZone:zone},end:{dateTime:end,timeZone:zone}};}
 test('partial final day remains timed and fails strict matching',()=>{
@@ -68,9 +76,9 @@ test('import tags copy and does not mutate original',()=>{
  c.importEvent('alice',e,'alice@example.com');assert.equal(e.summary,'PTO');assert.equal(state.imports[0].summary,'[alice] Away');assert.equal(state.imports[0].transparency,'transparent');assert.equal(state.imports[0].extendedProperties.private.awaySource,'alice@example.com/source');
 });
 test('inaccessible calendar does not block later users, and recovery retries',()=>{
- const {c,state}=context();const calls=[];let broken=true;
- const aliceKey='lastRun:your-calendar-id@group.calendar.google.com:alice@example.com';
- const bobKey='lastRun:your-calendar-id@group.calendar.google.com:bob@example.com';
+ const {c,state,config}=context();const calls=[];let broken=true;
+ const aliceKey=`lastRun:${config.TEAM_CALENDAR_ID}:alice@example.com`;
+ const bobKey=`lastRun:${config.TEAM_CALENDAR_ID}:bob@example.com`;
  state.properties[aliceKey]='2026-09-01T00:00:00.000Z';
  c.getCalendarEditors=()=>['alice@example.com','bob@example.com'];
  c.Calendar.Events.list=(email,params)=>{
@@ -113,7 +121,7 @@ test('runs without exclusions never load destination calendar',()=>{
  const {c}=context();c.findEvents=()=>[];c.Calendar.Events.list=()=>assert.fail('Unexpected destination lookup');c.runSync();
 });
 test('cleanup removes only legacy and departed-user state for this team',()=>{
- const {c,state}=context();const prefix='lastRun:your-calendar-id@group.calendar.google.com:';
+ const {c,state,config}=context();const prefix=`lastRun:${config.TEAM_CALENDAR_ID}:`;
  Object.assign(state.properties,{lastRun:'old',[prefix+'departed@example.com']:'old',[prefix+'alice@example.com']:'2026-09-01T00:00:00Z','lastRun:other-team:user':'keep',setting:'keep'});
  c.runSync();assert.equal(state.properties.lastRun,undefined);assert.equal(state.properties[prefix+'departed@example.com'],undefined);
  assert.ok(state.properties[prefix+'alice@example.com']);assert.equal(state.properties['lastRun:other-team:user'],'keep');assert.equal(state.properties.setting,'keep');
