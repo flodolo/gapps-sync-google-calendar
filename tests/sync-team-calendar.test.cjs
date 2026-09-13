@@ -75,6 +75,19 @@ test('import tags copy and does not mutate original',()=>{
  const {c,state,config}=context(),e={id:'source',summary:'PTO',eventType:'outOfOffice',start:{date:'2026-09-12'},end:{date:'2026-09-13'}};
  c.importEvent(config.TEAM_CALENDAR_IDS[0],'alice',e,'alice@example.com');assert.equal(e.summary,'PTO');assert.equal(state.imports[0].summary,'[alice] Away');assert.equal(state.imports[0].transparency,'transparent');assert.equal(state.imports[0].extendedProperties.private.awaySource,'alice@example.com/source');
 });
+test('imported copies carry no reminders, whatever the source had',()=>{
+ const {c,state,config}=context();
+ for (const reminders of [undefined,{useDefault:true},{useDefault:false,overrides:[{method:'popup',minutes:30}]}]) {
+  const e={id:'source',summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}};
+  if(reminders)e.reminders=reminders;
+  c.importEvent(config.TEAM_CALENDAR_IDS[0],'alice',e,'alice@example.com');
+ }
+ for (const copy of state.imports) {
+  assert.equal(copy.reminders.useDefault,false);
+  assert.equal(copy.reminders.overrides.length,0);
+ }
+ assert.equal(state.imports.length,3);
+});
 test('inaccessible calendar does not block later users, and recovery retries',()=>{
  const {c,state,config}=context();const calls=[];let broken=true;
  const aliceKey=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:alice@example.com`;

@@ -36,7 +36,8 @@ steps below run once per calendar.
    `MONTHS_IN_ADVANCE` months ahead.
 3. Events that qualify (see [Matching rules](#matching-rules)) are imported
    into the team calendar as `[username] Away`, shown as **Free** so they do
-   not affect anyone's availability.
+   not affect anyone's availability, and with reminders disabled so nobody is
+   notified about someone else's time off.
 4. Events that no longer qualify — cancelled, renamed out of the keyword list —
    have their previously imported copy removed from the team calendar.
 
@@ -52,6 +53,11 @@ Some details worth knowing:
   Incremental runs only look at events modified since that timestamp. If one
   calendar fails (revoked access, API error), its checkpoint is left untouched
   so the next run retries it, while the other calendars still advance.
+- **No reminders, no invitations.** Copies are written with
+  `reminders: { useDefault: false, overrides: [] }` and an empty attendee list.
+  Without the explicit reminder override a copy would inherit the source
+  event's reminders, and one arriving with `useDefault: true` would pick up the
+  team calendar's default reminders and alert every subscriber.
 - **Import tagging.** Every copy carries
   `extendedProperties.private.awaySource = "<email>/<source event id>"`, which
   is how the script recognises its own events later. Untagged copies from

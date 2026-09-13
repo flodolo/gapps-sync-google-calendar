@@ -425,6 +425,12 @@ function importEvent(calendarId, username, event, email) {
   };
   event.attendees = [];
   event.transparency = "transparent"; // Show as Free on the team calendar.
+  // Someone else's time off should never raise a notification. Without this the
+  // copy keeps the source event's reminders, and a copy arriving with
+  // 'useDefault: true' picks up the team calendar's own default reminders,
+  // which would alert everyone subscribed to it. An empty override list with
+  // the default disabled means no reminders at all.
+  event.reminders = { useDefault: false, overrides: [] };
 
   // If the event is not of type 'default', it can't be imported, so it needs
   // to be changed.
