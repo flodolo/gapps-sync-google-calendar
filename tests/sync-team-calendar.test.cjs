@@ -4,8 +4,8 @@ const vm = require('node:vm');
 const path = require('node:path');
 // Tests always run against the reference configuration, so a local config.js
 // cannot change their outcome.
-const source = ['config.dist.js', 'google-calendar.js']
-  .map((file) => fs.readFileSync(path.join(__dirname, file), 'utf8'))
+const source = ['config.dist.js', 'sync-team-calendar.js']
+  .map((file) => fs.readFileSync(path.join(__dirname, '..', 'scripts', file), 'utf8'))
   .join('\n');
 let passed = 0;
 function test(name, fn) { fn(); passed++; console.log('PASS', name); }

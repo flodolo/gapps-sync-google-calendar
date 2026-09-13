@@ -7,6 +7,20 @@ sample](https://developers.google.com/apps-script/samples/automations/vacation-c
 with a few substantial changes (see [Differences from the Google
 sample](#differences-from-the-google-sample)).
 
+## Repository layout
+
+```
+scripts/
+  sync-team-calendar.js   the script itself
+  config.dist.js          settings template, tracked
+  config.js               your settings, gitignored
+tests/
+  sync-team-calendar.test.cjs
+```
+
+`scripts/` holds exactly the files that get uploaded to the Apps Script
+project; everything else is local tooling.
+
 ## How it works
 
 1. The script reads the ACL of the team calendar and collects every individual
@@ -70,8 +84,9 @@ These are the functions to run from the Apps Script editor's function picker.
 
 ## Configuration
 
-All settings live in `config.js`, which is **not tracked in git**. Copy
-`config.dist.js` to `config.js` and edit the values there.
+All settings live in `scripts/config.js`, which is **not tracked in git**.
+Copy `scripts/config.dist.js` to `scripts/config.js` and edit the values
+there.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -84,7 +99,8 @@ All settings live in `config.js`, which is **not tracked in git**. Copy
 | `SANITIZED_TITLE` | `"Away"` | Title used for imported events when `SANITIZE_EVENTS` is true. |
 
 In Apps Script all files share a single global scope, so the constants defined
-in `config.js` are visible to `google-calendar.js` with no import.
+in `scripts/config.js` are visible to `scripts/sync-team-calendar.js` with no
+import.
 
 ## Setup
 
@@ -96,11 +112,11 @@ in `config.js` are visible to `google-calendar.js` with no import.
 3. **Create the Apps Script project.** Either a standalone script at
    [script.google.com](https://script.google.com), or push this directory with
    [`clasp`](https://github.com/google/clasp).
-4. **Configure.** `cp config.dist.js config.js`, set `TEAM_CALENDAR_ID` and
-   review the other settings.
-5. **Add the files to the project.** `config.js` and `google-calendar.js`
-   (`google-calendar.test.cjs` is only for local testing and should not be
-   uploaded).
+4. **Configure.** `cp scripts/config.dist.js scripts/config.js`, set
+   `TEAM_CALENDAR_ID` and review the other settings.
+5. **Add the files to the project.** Everything in `scripts/`, that is
+   `config.js` and `sync-team-calendar.js`. Tests live in `tests/`, outside
+   that directory, precisely because they should not be uploaded.
 6. **Confirm the Calendar advanced service is enabled.** Check the *Services*
    panel in the editor's sidebar: `Calendar` should be listed. If you created
    the project by copying Google's vacation-calendar sample, this is already
@@ -145,13 +161,13 @@ that person and carries on.
 ## Tests
 
 ```
-node google-calendar.test.cjs
+node tests/sync-team-calendar.test.cjs
 ```
 
-The tests run `google-calendar.js` in a `vm` context with stubbed Apps Script
-services (`Calendar`, `PropertiesService`, `LockService`, `Utilities`). They
-load `config.dist.js`, not `config.js`, so a local configuration cannot change
-the outcome. No dependencies beyond Node.
+The tests run `scripts/sync-team-calendar.js` in a `vm` context with stubbed
+Apps Script services (`Calendar`, `PropertiesService`, `LockService`,
+`Utilities`). They load `scripts/config.dist.js`, not `scripts/config.js`, so a
+local configuration cannot change the outcome. No dependencies beyond Node.
 
 ## Differences from the Google sample
 
