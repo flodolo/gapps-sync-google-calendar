@@ -26,7 +26,7 @@ function context() {
   c.getCalendarEditors=()=>['alice@example.com'];
   // Config constants are lexical declarations, so they are not properties of
   // the context object and have to be read from inside it.
-  const config=vm.runInContext('({TEAM_CALENDAR_ID})',c);
+  const config=vm.runInContext('({TEAM_CALENDAR_IDS})',c);
   return {c,state,config};
 }
 function timed(start,end,zone) {return {id:'source',summary:'Appointment',start:{dateTime:start,timeZone:zone},end:{dateTime:end,timeZone:zone}};}
@@ -72,13 +72,13 @@ test('fetch, import, and delete failures preserve timestamp and release lock',()
 });
 test('empty pages do not produce undefined events',()=>{const {c}=context();assert.equal(c.findEvents('alice',new Date(),new Date(),null).length,0);});
 test('import tags copy and does not mutate original',()=>{
- const {c,state}=context(),e={id:'source',summary:'PTO',eventType:'outOfOffice',start:{date:'2026-09-12'},end:{date:'2026-09-13'}};
- c.importEvent('alice',e,'alice@example.com');assert.equal(e.summary,'PTO');assert.equal(state.imports[0].summary,'[alice] Away');assert.equal(state.imports[0].transparency,'transparent');assert.equal(state.imports[0].extendedProperties.private.awaySource,'alice@example.com/source');
+ const {c,state,config}=context(),e={id:'source',summary:'PTO',eventType:'outOfOffice',start:{date:'2026-09-12'},end:{date:'2026-09-13'}};
+ c.importEvent(config.TEAM_CALENDAR_IDS[0],'alice',e,'alice@example.com');assert.equal(e.summary,'PTO');assert.equal(state.imports[0].summary,'[alice] Away');assert.equal(state.imports[0].transparency,'transparent');assert.equal(state.imports[0].extendedProperties.private.awaySource,'alice@example.com/source');
 });
 test('inaccessible calendar does not block later users, and recovery retries',()=>{
  const {c,state,config}=context();const calls=[];let broken=true;
- const aliceKey=`lastRun:${config.TEAM_CALENDAR_ID}:alice@example.com`;
- const bobKey=`lastRun:${config.TEAM_CALENDAR_ID}:bob@example.com`;
+ const aliceKey=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:alice@example.com`;
+ const bobKey=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:bob@example.com`;
  state.properties[aliceKey]='2026-09-01T00:00:00.000Z';
  c.getCalendarEditors=()=>['alice@example.com','bob@example.com'];
  c.Calendar.Events.list=(email,params)=>{
@@ -121,7 +121,7 @@ test('runs without exclusions never load destination calendar',()=>{
  const {c}=context();c.findEvents=()=>[];c.Calendar.Events.list=()=>assert.fail('Unexpected destination lookup');c.runSync();
 });
 test('cleanup removes only legacy and departed-user state for this team',()=>{
- const {c,state,config}=context();const prefix=`lastRun:${config.TEAM_CALENDAR_ID}:`;
+ const {c,state,config}=context();const prefix=`lastRun:${config.TEAM_CALENDAR_IDS[0]}:`;
  Object.assign(state.properties,{lastRun:'old',[prefix+'departed@example.com']:'old',[prefix+'alice@example.com']:'2026-09-01T00:00:00Z','lastRun:other-team:user':'keep',setting:'keep'});
  c.runSync();assert.equal(state.properties.lastRun,undefined);assert.equal(state.properties[prefix+'departed@example.com'],undefined);
  assert.ok(state.properties[prefix+'alice@example.com']);assert.equal(state.properties['lastRun:other-team:user'],'keep');assert.equal(state.properties.setting,'keep');
@@ -138,5 +138,39 @@ test('tagged copies for another source are not removed by legacy fallback',()=>{
  const {c,state}=context();c.findEvents=()=>[{id:'source',status:'cancelled'}];
  c.Calendar.Events.list=()=>({items:[{id:'source',summary:'[alice] Away',extendedProperties:{private:{awaySource:'other@example.com/source'}}}]});
  c.runSync();assert.equal(state.removed.length,0);
+});
+test('each team calendar syncs independently with its own members and checkpoints',()=>{
+ const {c,state,config}=context();
+ vm.runInContext('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")',c);
+ const [first,second]=config.TEAM_CALENDAR_IDS;
+ c.getCalendarEditors=(calendarId)=>calendarId===first?['alice@example.com']:['bob@example.com'];
+ c.findEvents=(email)=>[{id:`src-${email}`,summary:'PTO',start:{date:'2026-09-12'},end:{date:'2026-09-13'}}];
+ c.runSync();
+ assert.deepEqual(state.imports.map(e=>e.organizer.id),[first,second]);
+ assert.deepEqual(state.imports.map(e=>e.summary),['[alice] Away','[bob] Away']);
+ assert.ok(state.properties[`lastRun:${first}:alice@example.com`]);
+ assert.ok(state.properties[`lastRun:${second}:bob@example.com`]);
+ assert.equal(state.properties[`lastRun:${first}:bob@example.com`],undefined);
+});
+test('one unreachable team calendar does not stop the others',()=>{
+ const {c,state,config}=context();
+ vm.runInContext('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")',c);
+ const [first,second]=config.TEAM_CALENDAR_IDS;
+ c.getCalendarEditors=(calendarId)=>{if(calendarId===first)throw Error('ACL unavailable');return ['bob@example.com'];};
+ c.findEvents=()=>[];
+ assert.throws(()=>c.runSync(),/ACL unavailable/);
+ assert.ok(state.properties[`lastRun:${second}:bob@example.com`]);
+ assert.equal(state.released,1);
+});
+test('a failing member on one calendar leaves the other calendar advancing',()=>{
+ const {c,state,config}=context();
+ vm.runInContext('TEAM_CALENDAR_IDS.push("second@group.calendar.google.com")',c);
+ const [first,second]=config.TEAM_CALENDAR_IDS;
+ c.getCalendarEditors=()=>['alice@example.com'];
+ let calls=0;
+ c.findEvents=()=>{if(++calls===1)throw Error('503');return [];};
+ assert.throws(()=>c.runSync(),/1 calendar\(s\) failed/);
+ assert.equal(state.properties[`lastRun:${first}:alice@example.com`],undefined);
+ assert.ok(state.properties[`lastRun:${second}:alice@example.com`]);
 });
 console.log(`${passed} tests passed`);

@@ -4,11 +4,18 @@
 // from git, so local settings never end up in the repository.
 //
 // In Apps Script every file shares one global scope, so these constants are
-// visible to google-calendar.js without any import.
+// visible to sync-team-calendar.js without any import.
 
-// ID of the team calendar events are copied to. Find it in the calendar's
-// settings page, under "Integrate calendar" > "Calendar ID".
-const TEAM_CALENDAR_ID = "your-calendar-id@group.calendar.google.com";
+// IDs of the team calendars events are copied to. Find each one in the
+// calendar's settings page, under "Integrate calendar" > "Calendar ID".
+//
+// Each calendar is synced independently: its own ACL decides whose personal
+// calendar is scanned for it, and it keeps its own per-user checkpoints. A
+// person who is an editor on two of these calendars has their time off copied
+// to both. One unreachable calendar is reported but does not stop the others.
+const TEAM_CALENDAR_IDS = [
+  "your-calendar-id@group.calendar.google.com",
+];
 
 // Calendar ACL roles that identify a team member: their personal calendar is
 // scanned for out-of-office events. 'writer' is "Make changes to events",

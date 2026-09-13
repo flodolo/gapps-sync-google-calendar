@@ -18,7 +18,7 @@ limitations under the License.
 */
 
 // Configuration lives in config.js (copy config.dist.js to create it). In Apps
-// Script all files share one global scope, so TEAM_CALENDAR_ID, MEMBER_ROLES,
+// Script all files share one global scope, so TEAM_CALENDAR_IDS, MEMBER_ROLES,
 // KEYWORDS, MONTHS_IN_ADVANCE, STRICT_MATCH, SANITIZE_EVENTS and
 // SANITIZED_TITLE are defined there and used directly below.
 
@@ -106,12 +106,67 @@ function performSync(options) {
   // scan, including the first run after upgrading from the global lastRun.
   const properties = PropertiesService.getScriptProperties();
 
+  const strict =
+    options.strictMatch === undefined ? STRICT_MATCH : options.strictMatch;
+
+  // Each team calendar is synced independently: it has its own member list
+  // (its ACL), its own imported copies and its own per-user checkpoints. One
+  // unreachable team calendar must not stop the others, so failures are
+  // collected and reported once at the end.
+  let count = 0;
+  let skipped = 0;
+  let failed = 0;
+  const problems = [];
+  for (const calendarId of TEAM_CALENDAR_IDS) {
+    console.log("Team calendar: %s", calendarId);
+    try {
+      const result = syncTeamCalendar(
+        calendarId, today, maxDate, strict, options, properties,
+      );
+      count += result.count;
+      skipped += result.skipped;
+      failed += result.failed;
+    } catch (error) {
+      problems.push(`team calendar ${calendarId} failed: ${String(error)}`);
+      console.error(
+        "Team calendar %s failed: %s; will retry next run",
+        calendarId, String(error),
+      );
+    }
+  }
+
+  console.log(
+    `${options.dryRun ? "Would import" : "Imported"} ${count} events from completed calendars` +
+      `, excluded or cancelled ${skipped}, failed calendars ${failed}`,
+  );
+  if (failed) {
+    problems.push(`${failed} calendar(s) failed; see log above`);
+  }
+  if (problems.length) {
+    throw new Error(problems.join("\n"));
+  }
+}
+
+/**
+ * Syncs one team calendar: reads its ACL for the member list, then imports each
+ * member's qualifying events into it.
+ * @param {string} calendarId The team calendar to import into.
+ * @param {Date} today Start of the window.
+ * @param {Date} maxDate End of the window.
+ * @param {boolean} strict Whether STRICT_MATCH filtering applies.
+ * @param {Object} options The runSync() options.
+ * @param {Properties} properties The script properties store.
+ * @return {{count: number, skipped: number, failed: number}} Per-calendar tally.
+ */
+function syncTeamCalendar(calendarId, today, maxDate, strict, options, properties) {
   // Gets the list of people with write access to the team calendar.
-  const users = getCalendarEditors(TEAM_CALENDAR_ID);
+  const users = getCalendarEditors(calendarId);
   console.log(`Found ${users.length} team members with write access`);
 
+  const prefix = `lastRun:${calendarId}:`;
   if (!options.dryRun) {
-    const prefix = `lastRun:${TEAM_CALENDAR_ID}:`;
+    // Only this calendar's own keys are considered, so the checkpoints of the
+    // other team calendars are left alone.
     const activeKeys = new Set(users.map((email) => `${prefix}${email}`));
     for (const key of Object.keys(properties.getProperties())) {
       if (key === "lastRun" || (key.startsWith(prefix) && !activeKeys.has(key))) {
@@ -124,21 +179,18 @@ function performSync(options) {
   // cancelled or rescheduled source can refer to a copy outside this window.
   let importedEvents;
   const getImportedEvents = () => {
-    if (!importedEvents) importedEvents = listImportedEvents();
+    if (!importedEvents) importedEvents = listImportedEvents(calendarId);
     return importedEvents;
   };
 
   // For each user, finds events having one or more of the keywords in the event
   // summary in the specified date range. Imports each of those to the team
   // calendar.
-  const strict =
-    options.strictMatch === undefined ? STRICT_MATCH : options.strictMatch;
-
   let count = 0;
   let skipped = 0;
   let failed = 0;
   for (const email of users) {
-    const checkpoint = `lastRun:${TEAM_CALENDAR_ID}:${email}`;
+    const checkpoint = `${prefix}${email}`;
     try {
       const lastRun = options.ignoreLastRun
         ? null
@@ -146,7 +198,9 @@ function performSync(options) {
       const events = findEvents(
         email, today, maxDate, lastRun ? new Date(lastRun) : null,
       );
-      const result = syncUserEvents(email, events, strict, options.dryRun, getImportedEvents);
+      const result = syncUserEvents(
+        calendarId, email, events, strict, options.dryRun, getImportedEvents,
+      );
       count += result.count;
       skipped += result.skipped;
       if (!options.dryRun) {
@@ -157,18 +211,11 @@ function performSync(options) {
       console.error("Sync failed for %s: %s; will retry next run", email, String(error));
     }
   }
-
-  console.log(
-    `${options.dryRun ? "Would import" : "Imported"} ${count} events from completed calendars` +
-      `, excluded or cancelled ${skipped}, failed calendars ${failed}`,
-  );
-  if (failed) {
-    throw new Error(`${failed} calendar(s) failed; see log above`);
-  }
+  return { count, skipped, failed };
 }
 
-/** Sync one calendar; any failure leaves its checkpoint unchanged. */
-function syncUserEvents(email, events, strict, dryRun, getImportedEvents) {
+/** Sync one member's calendar; any failure leaves its checkpoint unchanged. */
+function syncUserEvents(calendarId, email, events, strict, dryRun, getImportedEvents) {
   const username = email.split("@")[0];
   let count = 0;
   let skipped = 0;
@@ -179,7 +226,7 @@ function syncUserEvents(email, events, strict, dryRun, getImportedEvents) {
         username, event.summary || "(no title)", event.id,
         event.status === "cancelled" ? "cancelled" : "not a strict match",
       );
-      removeImportedEvent(email, username, event, dryRun, getImportedEvents());
+      removeImportedEvent(calendarId, email, username, event, dryRun, getImportedEvents());
       skipped++;
       continue;
     }
@@ -194,7 +241,7 @@ function syncUserEvents(email, events, strict, dryRun, getImportedEvents) {
         copy.start.date ? ", all day; end exclusive" : "",
       );
     } else {
-      importEvent(username, event, email);
+      importEvent(calendarId, username, event, email);
     }
     count++;
   }
@@ -296,8 +343,8 @@ function eventLocalParts(boundary, timeZone) {
   return { date: match[1], time: match[2] };
 }
 
-/** Read the team calendar once and index copies for local matching. */
-function listImportedEvents() {
+/** Read the given team calendar once and index copies for local matching. */
+function listImportedEvents(calendarId) {
   const index = { bySource: new Map(), byId: new Map(), byUID: new Map() };
   const add = (map, key, event) => {
     if (!key) return;
@@ -306,7 +353,7 @@ function listImportedEvents() {
   };
   let pageToken;
   do {
-    const response = Calendar.Events.list(TEAM_CALENDAR_ID, {
+    const response = Calendar.Events.list(calendarId, {
       pageToken, maxResults: 2500, showDeleted: false,
     });
     for (const copy of response.items || []) {
@@ -322,7 +369,7 @@ function listImportedEvents() {
 }
 
 /** Remove only copies identifiable as this script's imports. */
-function removeImportedEvent(email, username, event, dryRun, index) {
+function removeImportedEvent(calendarId, email, username, event, dryRun, index) {
   let candidates = index.bySource.get(`${email}/${event.id}`) || [];
   // Legacy copies have no source tag. Retain the ID/UID and title checks,
   // without making requests for each excluded source event.
@@ -343,7 +390,7 @@ function removeImportedEvent(email, username, event, dryRun, index) {
     if (dryRun) {
       console.log("Would remove: %s (%s)", copy.summary, copy.id);
     } else {
-      Calendar.Events.remove(TEAM_CALENDAR_ID, copy.id);
+      Calendar.Events.remove(calendarId, copy.id);
       copy.status = "cancelled";
       console.log("Removed: %s (%s)", copy.summary, copy.id);
     }
@@ -353,10 +400,12 @@ function removeImportedEvent(email, username, event, dryRun, index) {
 /**
  * Imports the given event from the user's calendar into the shared team
  * calendar.
+ * @param {string} calendarId The team calendar to import into.
  * @param {string} username The team member that is attending the event.
  * @param {Calendar.Event} event The event to import.
+ * @param {string} email The team member's email address.
  */
-function importEvent(username, event, email) {
+function importEvent(calendarId, username, event, email) {
   event = JSON.parse(JSON.stringify(event));
   event.extendedProperties = { private: { awaySource: `${email}/${event.id}` } };
   event.summary = buildSummary(username, event);
@@ -372,7 +421,7 @@ function importEvent(username, event, email) {
     convertToAllDay(event);
   }
   event.organizer = {
-    id: TEAM_CALENDAR_ID,
+    id: calendarId,
   };
   event.attendees = [];
   event.transparency = "transparent"; // Show as Free on the team calendar.
@@ -387,7 +436,7 @@ function importEvent(username, event, email) {
 
   console.log("Importing: %s", event.summary);
   // Let failures reach the per-user handler so this calendar is retried.
-  Calendar.Events.import(event, TEAM_CALENDAR_ID);
+  Calendar.Events.import(event, calendarId);
 }
 
 /**
@@ -444,40 +493,60 @@ function inspectEvents() {
   const maxDate = new Date();
   maxDate.setDate(maxDate.getDate() + 30);
 
-  for (const email of getCalendarEditors(TEAM_CALENDAR_ID)) {
-    const events = findEvents(email, today, maxDate, null);
-    console.log("%s: %s events", email, events.length);
-    for (const event of events) {
-      console.log(
-        "  %s\n    start=%s end=%s tz=%s\n    allDay=%s strictMatch=%s",
-        event.summary,
-        JSON.stringify(event.start),
-        JSON.stringify(event.end),
-        (event.start && event.start.timeZone) || "(none)",
-        isAllDayEvent(event),
-        isStrictMatch(event),
-      );
+  for (const calendarId of TEAM_CALENDAR_IDS) {
+    console.log("Team calendar: %s", calendarId);
+    for (const email of getCalendarEditors(calendarId)) {
+      const events = findEvents(email, today, maxDate, null);
+      console.log("  %s: %s events", email, events.length);
+      for (const event of events) {
+        console.log(
+          "    %s\n      start=%s end=%s tz=%s\n      allDay=%s strictMatch=%s",
+          event.summary,
+          JSON.stringify(event.start),
+          JSON.stringify(event.end),
+          (event.start && event.start.timeZone) || "(none)",
+          isAllDayEvent(event),
+          isStrictMatch(event),
+        );
+      }
     }
   }
 }
 
 /**
- * Diagnostic helper: checks whether TEAM_CALENDAR_ID is reachable by the
- * account running the script, and with which access role. Run this manually
- * when acl.list returns 'Not Found'.
+ * Diagnostic helper: checks whether every calendar in TEAM_CALENDAR_IDS is
+ * reachable by the account running the script, and with which access role. Run
+ * this manually when acl.list returns 'Not Found'.
  */
 function diagnoseCalendarAccess() {
   console.log("Running as: %s", Session.getEffectiveUser().getEmail());
-  console.log("TEAM_CALENDAR_ID: %s", TEAM_CALENDAR_ID);
 
-  let entry;
-  try {
-    entry = Calendar.CalendarList.get(TEAM_CALENDAR_ID);
-  } catch (e) {
-    console.error(
-      "The calendar is not in this account's calendar list: %s",
-      e.toString(),
+  let unreachable = false;
+  for (const calendarId of TEAM_CALENDAR_IDS) {
+    let entry;
+    try {
+      entry = Calendar.CalendarList.get(calendarId);
+    } catch (e) {
+      unreachable = true;
+      console.error(
+        "%s is not in this account's calendar list: %s",
+        calendarId, e.toString(),
+      );
+      continue;
+    }
+    console.log(
+      "%s: found '%s' with accessRole '%s'",
+      calendarId, entry.summary, entry.accessRole,
     );
+    if (entry.accessRole !== "owner") {
+      console.warn(
+        "acl.list requires accessRole 'owner'; '%s' is not enough.",
+        entry.accessRole,
+      );
+    }
+  }
+
+  if (unreachable) {
     console.log("Calendars this account can see:");
     let pageToken = null;
     do {
@@ -487,40 +556,34 @@ function diagnoseCalendarAccess() {
       }
       pageToken = list.nextPageToken;
     } while (pageToken);
-    return;
-  }
-
-  console.log("Found '%s' with accessRole '%s'", entry.summary, entry.accessRole);
-  if (entry.accessRole !== "owner") {
-    console.warn(
-      "acl.list requires accessRole 'owner'; '%s' is not enough.",
-      entry.accessRole,
-    );
   }
 }
 
 /**
- * Diagnostic helper: logs every ACL entry of the team calendar, grouped by
+ * Diagnostic helper: logs every ACL entry of each team calendar, grouped by
  * role. Run this manually from the editor to check who administers the
- * calendar and which entries the sync will skip.
+ * calendars and which entries the sync will skip.
  */
 function listCalendarAccess() {
-  const byRole = {};
-  let pageToken = null;
-  do {
-    const response = Calendar.Acl.list(TEAM_CALENDAR_ID, {
-      pageToken: pageToken,
-    });
-    for (const rule of response.items) {
-      const entry = `${rule.scope.value || "(everyone)"} [${rule.scope.type}]`;
-      (byRole[rule.role] = byRole[rule.role] || []).push(entry);
-    }
-    pageToken = response.nextPageToken;
-  } while (pageToken);
+  for (const calendarId of TEAM_CALENDAR_IDS) {
+    console.log("Team calendar: %s", calendarId);
+    const byRole = {};
+    let pageToken = null;
+    do {
+      const response = Calendar.Acl.list(calendarId, {
+        pageToken: pageToken,
+      });
+      for (const rule of response.items) {
+        const entry = `${rule.scope.value || "(everyone)"} [${rule.scope.type}]`;
+        (byRole[rule.role] = byRole[rule.role] || []).push(entry);
+      }
+      pageToken = response.nextPageToken;
+    } while (pageToken);
 
-  // 'owner' is "Make changes and manage sharing", that is, the admins.
-  for (const role of Object.keys(byRole).sort()) {
-    console.log("%s (%s):\n  %s", role, byRole[role].length, byRole[role].join("\n  "));
+    // 'owner' is "Make changes and manage sharing", that is, the admins.
+    for (const role of Object.keys(byRole).sort()) {
+      console.log("  %s (%s):\n    %s", role, byRole[role].length, byRole[role].join("\n    "));
+    }
   }
 }
 
